@@ -137,6 +137,11 @@ def _load_replay():
     )
 
 
+# Resident CTAs per SM the persistent replay kernel sizes its grid for: 4 fit
+# its 128-register / ~44 KB budget (csrc/mamba3_replay_step.cu).
+_REPLAY_CTAS_PER_SM = 4
+
+
 def replay_step_supported(num_heads_local, head_dim, d_state, rank, num_angles, ngroups) -> bool:
     return (
         head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
@@ -150,10 +155,10 @@ def mamba3_replay_step(pools, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z
     """ReplaySSM decode step. ``pools`` is the full Olala Mamba3 state tuple
     (see ``state.mamba3_state_shape``); B, C: (N, R, S) pre-bias/rotation
     views (any batch stride); angle_proj: (N, 32) view."""
-    angle, anchor, kp, vp, xr, br, thr, scr, cnt = pools[:9]
-    rd, rd_scale = (pools[9], pools[10]) if len(pools) > 9 else (None, None)
+    angle, anchor, kp, vp, xr, br, scr, cnt = pools[:8]
+    rd, rd_scale = (pools[8], pools[9]) if len(pools) > 8 else (None, None)
     Dp = _fp32(Dp)
     A, dt, trap = _as_f32(A), _as_f32(dt), _as_f32(trap)
-    _load_replay().step(angle, anchor, rd, rd_scale, kp, vp, xr, br, thr, scr, cnt,
+    _load_replay().step(angle, anchor, rd, rd_scale, kp, vp, xr, br, scr, cnt,
                         A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
-                        bias_q, bias_k, angle_proj, slots, y)
+                        bias_q, bias_k, angle_proj, slots, y, _REPLAY_CTAS_PER_SM)

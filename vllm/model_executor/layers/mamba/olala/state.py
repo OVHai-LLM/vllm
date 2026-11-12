@@ -99,7 +99,7 @@ def mamba3_state_dtype(
         ssm_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
     dtypes = (torch.float32, ssm_dtype, state_dtype, state_dtype)
     if rc is not None:
-        dtypes += (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32, torch.int32)
+        dtypes += (torch.bfloat16, torch.bfloat16, torch.float32, torch.int32)
         if rc.read_fp8:
             dtypes += (torch.float8_e4m3fn, torch.float32)
     return dtypes
@@ -116,8 +116,8 @@ def mamba3_state_shape(
     """Shapes of ``(angle, ssm, k, v)`` per request slot.
 
     With ReplaySSM, ``ssm`` is the checkpoint anchor and the ring follows:
-    ``x (nh, L, head_dim)``, pre-bias/rotation ``B (L, mimo_dim, d_state)``
-    (shared by the heads: one group), the rotary phase ``(nh, L, angles)``,
+    ``x (nh, L, head_dim)``, the biased + rotated ``B' (nh, L, mimo_dim,
+    d_state)`` (bf16, stored by the step that decoded the token),
     ``(A*dt, gamma, beta, -) (nh, L, 4)`` and ``(count, flush target)
     (nh, 2)``; then the fp8 read copy ``(nh, head_dim, d_state)`` and its
     per-row scales ``(nh, head_dim)`` if enabled.
@@ -134,8 +134,7 @@ def mamba3_state_shape(
         L = rc.buffer_len
         shapes += (
             (nh, L, head_dim),
-            (L, mimo_dim, d_state),
-            (nh, L, num_rope_angles),
+            (nh, L, mimo_dim, d_state),
             (nh, L, 4),
             (nh, 2),
         )

@@ -48,9 +48,9 @@ def replay_reset(pools: tuple[torch.Tensor, ...], slots: torch.Tensor) -> None:
     n = slots.numel()
     if n == 0:
         return
-    anchor, cnt = pools[1], pools[8]
-    read_fp8 = len(pools) > 9
-    rd, rds = (pools[9], pools[10]) if read_fp8 else (anchor, anchor)
+    anchor, cnt = pools[1], pools[7]
+    read_fp8 = len(pools) > 8
+    rd, rds = (pools[8], pools[9]) if read_fp8 else (anchor, anchor)
     H, D, S = anchor.shape[1:]
     L = pools[4].shape[2]
     _replay_reset_kernel[(n, H)](

@@ -3,7 +3,8 @@
 """Olala ReplaySSM decode step (csrc/mamba3_replay_step.cu) against the plain
 CUDA Mamba-3 step on an fp32 state, over enough steps to wrap the ring several
 times with staggered flush targets and padded batch rows (PAD_SLOT_ID and the
-null block 0 that CUDA-graph padding uses)."""
+null block 0 that CUDA-graph padding uses). The larger batch gives each CTA of
+the persistent kernel several tokens, so its prefetch pipeline is exercised."""
 
 import pytest
 import torch
@@ -27,8 +28,7 @@ def _pools(P, L, anchor_dtype, read_fp8, ang0, ssm0, k0, v0):
     pools = [
         ang0.clone(), ssm0.to(anchor_dtype).clone(), k0.clone(), v0.clone(),
         torch.zeros(P, H, L, D, device="cuda", dtype=bf),
-        torch.zeros(P, L, R, S, device="cuda", dtype=bf),
-        torch.zeros(P, H, L, NA, device="cuda"),
+        torch.zeros(P, H, L, R, S, device="cuda", dtype=bf),
         torch.zeros(P, H, L, 4, device="cuda"),
         torch.zeros(P, H, 2, device="cuda", dtype=torch.int32),
     ]
@@ -44,9 +44,10 @@ def _pools(P, L, anchor_dtype, read_fp8, ang0, ssm0, k0, v0):
 @pytest.mark.parametrize("L", [8, 16])
 @pytest.mark.parametrize("anchor_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("read_fp8", [False, True])
-def test_replay_step_matches_plain_step(L, anchor_dtype, read_fp8):
+@pytest.mark.parametrize("N", [24, 300])
+def test_replay_step_matches_plain_step(L, anchor_dtype, read_fp8, N):
     torch.manual_seed(0)
-    N, P, T = 24, 40, 3 * L + 5
+    P, T = N + 16, 3 * L + 5
     bf = torch.bfloat16
     slots = (torch.randperm(P - 1, device="cuda")[:N] + 1).to(torch.int32)
     slots[3] = -1  # padded row
@@ -90,7 +91,7 @@ def test_replay_step_matches_plain_step(L, anchor_dtype, read_fp8):
         torch.testing.assert_close(pools[0][slots[valid].long()], ref[0][slots[valid].long()])
         # right after a flush the anchor is the full state
         sl = slots[valid].long()
-        flushed = sl[(pools[8][sl, :, 0] == 0).all(dim=1)]
+        flushed = sl[(pools[7][sl, :, 0] == 0).all(dim=1)]
         if flushed.numel():
             st0, st1 = ref[1][flushed], pools[1][flushed].float()
             # fp32 anchor: the flush GEMM is ~fp32 accurate; bf16: one rounding of the state
