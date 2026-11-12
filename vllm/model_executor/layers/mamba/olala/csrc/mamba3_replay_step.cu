@@ -16,19 +16,22 @@
 // decoded the token (each B' is rotated once, at its own step, and only read afterwards); (A*dt, gamma, beta, -)
 // (H, L, 4) fp32; (count, flush target) (H, 2) int32.
 //
-// Execution (organized around latency: the work per (token, head) is small and was a serial chain of loads,
-// barriers and a single-thread scan): one CTA per (head, group of tokens) walks its tokens, with the head's
-// constants (rotary biases, x/z/out projections) loaded once; a two-stage cp.async pipeline lands the next token's
-// ring rows, z row and phase while the current token computes, and the per-token scalars (slot, ring count, dt, A,
-// trap) are fetched two tokens ahead so a prefetch knows the ring extent. The fp8 checkpoint tile goes straight to
-// registers (no shared memory, which bounds the CTAs per SM), with the mma k order permuted consistently between
-// the tile and C'. Warp w owns
-// state rows [16w, 16w + 16) in the mma fragment layout (lane: g = lane / 4 -> rows 16w + g and 16w + g + 8,
-// qd = lane % 4 -> columns 8j + 2qd, +1). Tensor cores: G = B' C'^T (bf16), the fp8 checkpoint read S_c C'^T
-// (fp8 -> f16 is exact, f16 C' is exact), the window term sum_k (w_k x_k) G_k and the flush update
-// sum_k w_k X_k (x) B'_k, the last two with their fp32 operands split in two bf16 terms (hi + lo: ~fp32 accurate).
-// B300, L = 8, bf16 anchor + fp8 read: 134 us per layer at 256 tokens, 495 at 1024 (the previous one-CTA-per-
-// (head, token) kernel: 175 / 675; the plain fp32-state step: 161 / 604).
+// Execution: two kernels, launched back to back.
+//  - replay_flush_kernel runs the flush steps (one token in L per head, staggered by slot): a CTA scans a few tokens
+//    of a head and flushes each with the whole CTA (warp w: state rows [16w, 16w + 16)), every load issued at once;
+//    S is accumulated in fp32 on tensor cores, its output dot taken on tensor cores, the anchor rounded
+//    stochastically (the sm_100a / sm_103a cvt.rs instruction where the build targets it) and the fp8 copy
+//    rewritten. It leaves the count at (0, -L).
+//  - replay_step_kernel runs every other step: one CTA per (head, group of tokens), persistent, a two-stage cp.async
+//    pipeline for the next token's ring rows / z / phase, the per-token scalars fetched two tokens ahead, the fp8
+//    checkpoint tile loaded straight into mma fragments (k order permuted consistently in C'), G = B' C'^T, the
+//    checkpoint read and the window term on tensor cores. It skips the tokens marked (0, -L), restoring (0, L).
+//    Without the flush path it fits 96 registers and, with the head's constants in registers / L1 rather than
+//    shared memory, 5 CTAs per SM.
+// Warp fragment layout as the plain step (lane: g = lane / 4 -> rows 16w + g and 16w + g + 8, qd = lane % 4 ->
+// columns 8j + 2qd, +1); fp32 operands of bf16 mma are split in two bf16 terms (hi + lo: ~fp32 accurate).
+// B300, L = 8, bf16 anchor + fp8 read, per layer: 115 us at 256 tokens, 414 at 1024 (one kernel, one CTA per
+// (head, token): 175 / 675; the plain fp32-state step: 158 / 596).
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
@@ -67,6 +70,11 @@ __device__ __forceinline__ void mma_f16(float* c, const uint32_t* a, const uint3
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) { __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi); return *reinterpret_cast<uint32_t*>(&v); }
+// (u0, u1) ~= hi + lo, two bf16x2 terms (~16 mantissa bits): one rounding conversion per term
+__device__ __forceinline__ void split2(float u0, float u1, uint32_t& hi, uint32_t& lo) {
+  hi = pack_bf16(u0, u1);
+  lo = pack_bf16(u0 - __uint_as_float(hi << 16), u1 - __uint_as_float(hi & 0xffff0000u));
+}
 __device__ __forceinline__ uint32_t bf16x2_to_f16x2(uint32_t v) {
   const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
   __half2 h = __floats2half2_rn(f.x, f.y); return *reinterpret_cast<uint32_t*>(&h);
@@ -83,6 +91,18 @@ __device__ __forceinline__ __nv_bfloat16 bf16_sr(float v, uint32_t rnd) {
   uint32_t u = __float_as_uint(v);
   if ((u & 0x7f800000u) != 0x7f800000u) u = (u + (rnd & 0xffffu)) & 0xffff0000u;
   return __ushort_as_bfloat16((unsigned short)(u >> 16));
+}
+// fp32 pair -> bf16x2 with stochastic rounding (16 random bits per value): the sm_100a / sm_103a instruction when the
+// build targets it (REPLAY_HW_SR), else in software
+__device__ __forceinline__ uint32_t bf16x2_sr(float lo, float hi, uint32_t rnd) {
+#ifdef REPLAY_HW_SR
+  uint32_t d;
+  asm("cvt.rs.satfinite.bf16x2.f32 %0, %1, %2, %3;" : "=r"(d) : "f"(hi), "f"(lo), "r"(rnd));
+  return d;
+#else
+  __nv_bfloat162 v; v.x = bf16_sr(lo, rnd); v.y = bf16_sr(hi, rnd >> 16 | rnd << 16);
+  return *reinterpret_cast<uint32_t*>(&v);
+#endif
 }
 
 struct Args {
@@ -104,7 +124,8 @@ struct StageLayout {
     bk_rows = ((n * R + 15) / 16) * 16;
     bk = o;    o += bk_rows * LDB * 2;  // B' rows (k, r): token 0 = k_pool, ring, current (rotated in place)
     cb = o;    o += 8 * LDB * 2;        // C rows; 4..7 zero
-    xb = o;    o += n * D * 2;          // x_k
+    xb = o;    o += n * D * 2;          // x_k (the window reads up to the 16-token boundary, masked: lands in this
+                                        // stage's following buffers, still inside the CTA's shared memory)
     scr = o;   o += L * 4 * 4;          // ring (A*dt, gamma, beta, -)
     z = o;     o += D * 2;
     angst = o; o += NA * 4;             // carried phase
@@ -114,24 +135,20 @@ struct StageLayout {
 };
 struct Layout {
   StageLayout st;
-  int stage, bias, xproj, zproj, outproj, ch, G, w, slots, total;
+  int stage, G, w, slots, total;
   __host__ __device__ Layout(int L, int tpc) : st(L) {
+    // shared memory bounds the CTAs per SM (5 at L = 8): the head's constants live in registers / L1 instead
     const int n = L + 1; int o = 0;
     stage = o;   o += 2 * st.total;
-    bias = o;    o += 2 * R * S * 4;    // bias_k, bias_q of this head
-    xproj = o;   o += R * D * 4;
-    zproj = o;   o += R * D * 4;
-    outproj = o; o += R * D * 4;
-    ch = o;      o += 8 * LDB * 2;      // C' f16, rows 4..7 zero
-    G = o;       o += n * R * R * 4;
-    w = o;       o += n * 4;
+    G = o;       o += (st.bk_rows > ((n + 15) / 16) * 16 * R ? st.bk_rows : ((n + 15) / 16) * 16 * R) * R * 4;
+    w = o;       o += ((n + 15) / 16) * 16 * 4;
     slots = o;   o += tpc * 4;
     total = (o + 15) / 16 * 16;
   }
 };
 
 struct Tok {   // per-token scalars
-  int slot, hc, lim; float dt, A, trap; bool valid;
+  int slot, hc, lim, lim_raw; float dt, A, trap; bool valid, flushed;
 };
 
 __device__ __forceinline__ Tok load_tok(const Args& a, const int* sSlots, int i, int b, int h) {
@@ -144,12 +161,13 @@ __device__ __forceinline__ Tok load_tok(const Args& a, const int* sSlots, int i,
   k.dt = a.dt[b * a.H + h]; k.A = a.A[b * a.H + h]; k.trap = a.trap[b * a.H + h];
   return k;
 }
-__device__ __forceinline__ void clamp_tok(Tok& k, int L) {   // defensive: stay inside the ring
+__device__ __forceinline__ void clamp_tok(Tok& k, int L) {   // flush marker; defensive: stay inside the ring
+  k.lim_raw = k.lim; k.flushed = k.lim < 0;
   k.hc = min(max(k.hc, 0), L - 1); k.lim = min(max(k.lim, 1), L);
 }
 
 __device__ __forceinline__ void issue_stage(const Args& a, char* stg, const StageLayout& sl, const Tok& k, int b, int h, int t) {
-  if (!k.valid) return;
+  if (!k.valid || k.flushed) return;
   const int H = a.H, slot = k.slot, hc = k.hc, n = hc + 2, cur = n - 1;
   __nv_bfloat16* sBk = reinterpret_cast<__nv_bfloat16*>(stg + sl.bk);
   __nv_bfloat16* sCb = reinterpret_cast<__nv_bfloat16*>(stg + sl.cb);
@@ -173,24 +191,388 @@ __device__ __forceinline__ void issue_stage(const Args& a, char* stg, const Stag
   else if (q >= 16 && q < 20) cp16(stg + sl.angp + (q - 16) * 16, a.angp + (size_t)b * a.angp_stride + (q - 16) * 8);
 }
 
+constexpr int WARPS = THREADS / 32;
+
+// a warp's token buffer: what a step reads, filled by cp.async
+struct BufLayout {
+  int c, bc, x, z, angst, angp, scr, total;
+  __host__ __device__ BufLayout(int L) {
+    int o = 0;
+    c = o;     o += R * LDB * 2;        // C rows -> C' (bf16), rotated in place
+    bc = o;    o += R * LDB * 2;        // current B rows -> B'
+    x = o;     o += (L + 1) * D * 2;    // x_0 (v_pool), the ring, x_cur at index hc + 1
+    z = o;     o += D * 2;
+    angst = o; o += NA * 4;             // carried phase
+    angp = o;  o += NA * 2;
+    scr = o;   o += L * 16;             // ring (A*dt, gamma, beta, -)
+    total = (o + 127) / 128 * 128;
+  }
+};
+// a warp's scratch: G, the window weights, the phase and a few scalars
+struct ScrLayout {
+  int G, w, th, misc, total;
+  __host__ __device__ ScrLayout(int L) {
+    const int n = L + 1; int o = 0;
+    G = o;    o += n * R * R * 4;
+    w = o;    o += (n + 1) * 4;
+    th = o;   o += NA * 4;
+    misc = o; o += 64;
+    total = (o + 127) / 128 * 128;
+  }
+};
+struct ConstLayout {   // the head's constants
+  int bias, xproj, zproj, outproj, total;
+  __host__ __device__ ConstLayout() {
+    int o = 0;
+    bias = o;    o += 2 * R * S * 4;    // bias_k, bias_q
+    xproj = o;   o += R * D * 4;
+    zproj = o;   o += R * D * 4;
+    outproj = o; o += R * D * 4;
+    total = o;
+  }
+};
+struct FlushLayout {
+  ConstLayout cl; BufLayout bl; ScrLayout sl;
+  int buf, scr, fb, list, total;
+  __host__ __device__ FlushLayout(int L, int tpc) : bl(L), sl(L) {
+    int o = cl.total;
+    buf = o;  o += bl.total;
+    scr = o;  o += sl.total;
+    fb = o;   o += (((L + 1) * R + 15) / 16) * 16 * LDB * 2;   // the window's B' rows, mma operand
+    list = o; o += tpc * 16;          // (token, slot, count, flush target) of each flush
+    total = (o + 15) / 16 * 16;
+  }
+};
+enum { M_DECAY = 0, M_LCUR = 1 };
+
+__device__ __forceinline__ Tok load_tok(const Args& a, int b, int h) {
+  Tok k;
+  k.slot = a.slots[b];
+  k.valid = k.slot > 0 && k.slot < a.P;   // PAD_SLOT_ID (-1) and the null block (0) are padding
+  const int s = k.valid ? k.slot : 0;
+  const int* cntp = a.cnt + (size_t)s * a.cnt_sst + h * 2;
+  k.hc = cntp[0]; k.lim = cntp[1];
+  k.dt = a.dt[b * a.H + h]; k.A = a.A[b * a.H + h]; k.trap = a.trap[b * a.H + h];
+  return k;
+}
+__device__ __forceinline__ void load_consts(const Args& a, char* smem, const ConstLayout& cl, int h, int t) {
+  const int H = a.H;
+  static_assert(THREADS == R * S / 4 && 2 * THREADS >= 3 * R * D / 4, "constant load mapping");
+  {   // biases: thread t takes chunk t of bias_k and of bias_q (rows r = t / 32)
+    const int r = t >> 5, c = (t & 31) * 4;
+    cp16(smem + cl.bias + (r * S + c) * 4, a.bias_k + ((size_t)r * H + h) * S + c);
+    cp16(smem + cl.bias + ((R + r) * S + c) * 4, a.bias_q + ((size_t)r * H + h) * S + c);
+  }
+  {   // projections: 3 x 64 chunks
+    const int r = (t >> 4) & 3, c = (t & 15) * 4;
+    const float* src0 = t < 64 ? a.xproj : a.zproj;
+    cp16(smem + (t < 64 ? cl.xproj : cl.zproj) + (r * D + c) * 4, src0 + ((size_t)r * H + h) * D + c);
+    if (t < 64) cp16(smem + cl.outproj + (r * D + c) * 4, a.outproj + ((size_t)r * H + h) * D + c);
+  }
+  cp_commit();
+}
+
+// a warp issues its token's buffer loads (one cp.async group per lane)
+__device__ __forceinline__ void issue_buf(const Args& a, char* buf, const BufLayout& bl, const Tok& k, int b, int h, int lane) {
+  if (k.valid && !k.flushed) {
+    const int H = a.H, slot = k.slot, hc = k.hc;
+    for (int i = lane; i < R * (S / 8); i += 32) {
+      const int r = i >> 4, c = (i & 15) * 8;
+      cp16(buf + bl.c + (r * LDB + c) * 2, a.Cm + (size_t)b * a.bc_bstride + r * S + c);
+      cp16(buf + bl.bc + (r * LDB + c) * 2, a.Bm + (size_t)b * a.bc_bstride + r * S + c);
+    }
+    const __nv_bfloat16* xr = a.xr + (size_t)slot * a.xr_sst + (size_t)h * a.L * D;
+    if (lane < 8) {
+      cp16(buf + bl.x + lane * 16, a.vp + (size_t)slot * a.vp_sst + h * D + lane * 8);
+      cp16(buf + bl.x + ((hc + 1) * D + lane * 8) * 2, a.x + ((size_t)b * H + h) * D + lane * 8);
+      cp16(buf + bl.z + lane * 16, a.z + ((size_t)b * H + h) * D + lane * 8);
+      cp16(buf + bl.angst + lane * 16, a.angle + (size_t)slot * a.ang_sst + (size_t)h * NA + lane * 4);
+    } else if (lane < 12) {
+      cp16(buf + bl.angp + (lane - 8) * 16, a.angp + (size_t)b * a.angp_stride + (lane - 8) * 8);
+    }
+    for (int i = lane; i < hc * (D / 8); i += 32) cp16(buf + bl.x + (D + i * 8) * 2, xr + i * 8);
+    for (int i = lane; i < hc; i += 32) cp16(buf + bl.scr + i * 16, a.scr + (size_t)slot * a.scr_sst + ((size_t)h * a.L + i) * 4);
+  }
+  cp_commit();
+}
+
+
+
+// A warp's per-token prologue: phase of angle `lane`, B'_cur and C' rotated in place in the buffer, window weights
+// (scratch); returns the phase.
+__device__ __forceinline__ float token_prologue(char* buf, const BufLayout& bl, float* sThw, float* sW, float* sMisc,
+                                                const float* sBias, int n, float dt, float lam, float gam, float bet, int lane,
+                                                int warp = 0, int nwarps = 1) {
+  const int cur = n - 1;
+  __nv_bfloat16* sC = reinterpret_cast<__nv_bfloat16*>(buf + bl.c);
+  __nv_bfloat16* sBc = reinterpret_cast<__nv_bfloat16*>(buf + bl.bc);
+  const float* sScr = reinterpret_cast<const float*>(buf + bl.scr);
+      // ---- phase of angle `lane` (accurate sincos, wrapped to [0, 2 pi)); B'_cur, C' with it, in place, bf16-rounded:
+      // lane l owns columns l, l + 64 (rotated pair) and l + 32, l + 96 (bias only) of the 8 rows
+      float th = reinterpret_cast<const float*>(buf + bl.angst)[lane]
+               + tanhf(bf2f(reinterpret_cast<const __nv_bfloat16*>(buf + bl.angp)[lane])) * dt * PI;
+      th -= TWO_PI * floorf(th / TWO_PI);
+      float sn, cs; sincosf(th, &sn, &cs);
+      if (warp == 0) sThw[lane] = th;
+      for (int row = warp; row < 2 * R; row += nwarps) {   // the CTA's warps split the 8 rows
+        const bool isC = row >= R;
+        const int r = row & 3;
+        __nv_bfloat16* rp = (isC ? sC : sBc) + r * LDB;
+        const float* bias = sBias + ((isC ? R : 0) + r) * S;
+        const float v0 = bf2f(rp[lane]) + bias[lane], v1 = bf2f(rp[lane + HALF]) + bias[lane + HALF];
+        const float u0 = bf2f(rp[lane + 32]) + bias[lane + 32], u1 = bf2f(rp[lane + 96]) + bias[lane + 96];
+        rp[lane] = __float2bfloat16(v0 * cs - v1 * sn); rp[lane + HALF] = __float2bfloat16(v0 * sn + v1 * cs);
+        rp[lane + 32] = __float2bfloat16(u0); rp[lane + 96] = __float2bfloat16(u1);
+      }
+      // ---- window weights: lane k sums its own prefix of the log-decays; token 0 = the checkpoint
+      for (int tk = warp == 0 ? lane : n; tk < n; tk += 32) {
+        float Lt = 0.f, Lt1 = 0.f, Lc = 0.f;
+        for (int kk = 1; kk < cur; ++kk) {
+          Lc += sScr[(kk - 1) * 4];
+          if (kk == tk) Lt = Lc;
+          if (kk == tk + 1) Lt1 = Lc;
+        }
+        Lc += lam;
+        if (tk == cur) Lt = Lc;
+        if (tk + 1 == cur) Lt1 = Lc;
+        const float gk = tk == 0 ? 0.f : tk == cur ? gam : sScr[(tk - 1) * 4 + 1];
+        float wk = gk * __expf(Lc - Lt);
+        if (tk + 1 < n) wk += (tk + 1 == cur ? bet : sScr[tk * 4 + 2]) * __expf(Lc - Lt1);
+        sW[tk] = wk;
+        if (tk == 0) { sMisc[M_DECAY] = __expf(Lc); sMisc[M_LCUR] = Lc; }
+      }
+      __syncwarp();
+
+  return th;
+}
+
+#ifndef REPLAY_FLUSH_TPC
+#define REPLAY_FLUSH_TPC 4   // tokens of a head per flush CTA
+#endif
+#ifndef REPLAY_FLUSH_MINB
+#define REPLAY_FLUSH_MINB 4
+#endif
+// Flush steps, before the main kernel: a CTA owns ~8 tokens of a head (the flush targets are staggered by slot, so
+// about one of them flushes per step) and runs each flush with the whole CTA (warp w: state rows [16w, 16w + 16)).
+// Every load of a flush is issued at once (the warp-0 token buffer, the window's B' rows, the anchor fragments).
+template <bool ANCHOR_F32, bool READ_FP8>
+__global__ void __launch_bounds__(THREADS, REPLAY_FLUSH_MINB) replay_flush_kernel(const Args a, int tpc) {
+  extern __shared__ __align__(128) char smem[];
+  const FlushLayout lo(a.L, tpc);
+  const float* sBias = reinterpret_cast<const float*>(smem + lo.cl.bias);
+  const float* sXp = reinterpret_cast<const float*>(smem + lo.cl.xproj);
+  const float* sZp = reinterpret_cast<const float*>(smem + lo.cl.zproj);
+  const float* sOp = reinterpret_cast<const float*>(smem + lo.cl.outproj);
+  __nv_bfloat16* sFB = reinterpret_cast<__nv_bfloat16*>(smem + lo.fb);
+  int* sList = reinterpret_cast<int*>(smem + lo.list);
+  __shared__ int sCount;
+  const int H = a.H, L = a.L, h = blockIdx.x, j0 = blockIdx.y, nb = gridDim.y, t = threadIdx.x;
+  const int warp = t >> 5, lane = t & 31, g = lane >> 2, qd = lane & 3;
+  const int mi = lane >> 3, li = lane & 7;
+  const int p0 = warp * 16 + g, p1 = p0 + 8;
+  const int ntok = (a.N - j0 + nb - 1) / nb;
+  if (ntok <= 0) return;
+  load_consts(a, smem, lo.cl, h, t);   // in flight during the scan
+  if (t == 0) sCount = 0;
+  __syncthreads();
+  for (int i = t; i < ntok; i += THREADS) {   // this CTA's flush tokens
+    const int slot = a.slots[j0 + i * nb];
+    if (slot > 0 && slot < a.P) {
+      const int* cntp = a.cnt + (size_t)slot * a.cnt_sst + h * 2;
+      const int hc = min(max(cntp[0], 0), L - 1), lim = min(max(cntp[1], 1), L);
+      if (hc + 1 >= lim) { const int q = atomicAdd(&sCount, 1); *reinterpret_cast<int4*>(sList + 4 * q) = make_int4(i, slot, hc, lim); }
+    }
+  }
+  __syncthreads();
+  const int nflush = sCount;
+  if (nflush == 0) return;
+  const float Dh = a.Dp[h];
+  char* fbuf_w = smem + lo.buf;
+  char* fs_w = smem + lo.scr;
+  float xp[2][R], xpq[2][2];
+  for (int f = 0; f < nflush; ++f) {
+    const int4 fe = *reinterpret_cast<const int4*>(sList + 4 * f);
+    const int fbt = j0 + fe.x * nb;
+    Tok k;   // from the scan (no second dependent load); the count is not re-read
+    k.slot = fe.y; k.hc = fe.z; k.lim = fe.w; k.lim_raw = fe.w; k.valid = true; k.flushed = false;
+    k.dt = a.dt[fbt * H + h]; k.A = a.A[fbt * H + h]; k.trap = a.trap[fbt * H + h];
+    const int slot = k.slot, hc = k.hc, n = hc + 2, cur = n - 1, nrows = n * R, nks = (nrows + 15) / 16;
+    // ---- every load at once: warp 0's token buffer, the window's B' rows but the current one, the anchor
+    if (warp == 0) issue_buf(a, fbuf_w, lo.bl, k, fbt, h, lane);
+    for (int i2 = t; i2 < nks * 16 * (S / 8); i2 += THREADS) {
+      const int m = i2 >> 4, c = (i2 & 15) * 8, kk = m >> 2, r = m & 3;
+      __nv_bfloat16* dst = sFB + m * LDB + c;
+      if (m >= nrows) *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+      else if (kk != cur) cp16(dst, kk == 0 ? a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c
+                                            : a.br + (size_t)slot * a.br_sst + (((size_t)h * L + kk - 1) * R + r) * S + c);
+    }
+    cp_commit();
+    float acc[16][4];
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt) {
+      const int nn2 = jt * 8 + 2 * qd;
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const size_t off = (size_t)slot * a.anc_sst + ((size_t)h * D + (e ? p1 : p0)) * S + nn2;
+        float2 v;
+        if constexpr (ANCHOR_F32) v = *reinterpret_cast<const float2*>(reinterpret_cast<const float*>(a.anchor) + off);
+        else v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(reinterpret_cast<const __nv_bfloat16*>(a.anchor) + off));
+        acc[jt][2 * e] = v.x; acc[jt][2 * e + 1] = v.y;
+      }
+    }
+    cp_wait<0>();
+    __syncthreads();
+    if (f == 0) {
+#pragma unroll
+      for (int r = 0; r < R; ++r) { xp[0][r] = sXp[r * D + p0]; xp[1][r] = sXp[r * D + p1]; }
+#pragma unroll
+      for (int e = 0; e < 2; ++e) { xpq[e][0] = xp[e][2 * (qd & 1)]; xpq[e][1] = xp[e][2 * (qd & 1) + 1]; }
+    }
+    // ---- phase, B'_cur / C' rotation (two rows per warp), window weights (warp 0)
+    {
+      const float dt = k.dt, alpha = __expf(k.A * dt), lam = k.A * dt, gam = k.trap * dt, bet = (1.f - k.trap) * dt * alpha;
+      token_prologue(fbuf_w, lo.bl, reinterpret_cast<float*>(fs_w + lo.sl.th), reinterpret_cast<float*>(fs_w + lo.sl.w),
+                     reinterpret_cast<float*>(fs_w + lo.sl.misc), sBias, n, dt, lam, gam, bet, lane, warp, WARPS);
+    }
+    __syncthreads();
+    const float* fmf = reinterpret_cast<const float*>(fs_w + lo.sl.misc);
+    const __nv_bfloat16* fC = reinterpret_cast<const __nv_bfloat16*>(fbuf_w + lo.bl.c);
+    const __nv_bfloat16* fBc = reinterpret_cast<const __nv_bfloat16*>(fbuf_w + lo.bl.bc);
+    const __nv_bfloat16* fX = reinterpret_cast<const __nv_bfloat16*>(fbuf_w + lo.bl.x);
+    const __nv_bfloat16* fZ = reinterpret_cast<const __nv_bfloat16*>(fbuf_w + lo.bl.z);
+    const float* fW = reinterpret_cast<const float*>(fs_w + lo.sl.w);
+    const float* fTh = reinterpret_cast<const float*>(fs_w + lo.sl.th);
+    const int fb = fbt;
+    const float decay = fmf[M_DECAY];
+    if (t < R * (S / 8)) {   // the current B' joins the staged rows
+      const int r = t >> 4, c = (t & 15) * 8;
+      *reinterpret_cast<uint4*>(sFB + (cur * R + r) * LDB + c) = *reinterpret_cast<const uint4*>(fBc + r * LDB + c);
+    }
+#pragma unroll
+    for (int jt = 0; jt < 16; ++jt)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) acc[jt][q] *= decay;
+    __syncthreads();
+      for (int ks = 0; ks < nks; ++ks) {
+        uint32_t ahi[4], alo[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {   // rows m = 16 ks + 2qd + 8 (q >> 1) + {0, 1}: one token km, ranks 2 (qd & 1) + {0, 1}
+          const int e = q & 1, m = ks * 16 + 2 * qd + (q >> 1) * 8, km = m >> 2, p = e ? p1 : p0;
+          const float wx = m < nrows ? fW[km] * bf2f(fX[km * D + p]) : 0.f;
+          split2(wx * xpq[e][0], wx * xpq[e][1], ahi[q], alo[q]);
+        }
+#pragma unroll
+        for (int jp = 0; jp < 8; ++jp) {
+          uint32_t bfr[4];
+          ldsm_x4_t(bfr, sFB + (ks * 16 + (mi & 1) * 8 + li) * LDB + jp * 16 + (mi >> 1) * 8);
+          mma_bf16(acc[2 * jp], ahi, bfr); mma_bf16(acc[2 * jp], alo, bfr);
+          mma_bf16(acc[2 * jp + 1], ahi, bfr + 2); mma_bf16(acc[2 * jp + 1], alo, bfr + 2);
+        }
+      }
+      // output from the full state: o = S C'^T on tensor cores (the accumulators of two n8 tiles are the A fragment of
+      // a k16 step), S split hi + lo; lane qd ends up with r2 = qd for rows p0, p1
+      float o[2];
+      {
+        float c4[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          uint32_t ahi[4], alo[4], bfr[2] = {0u, 0u};
+          split2(acc[2 * c][0], acc[2 * c][1], ahi[0], alo[0]);
+          split2(acc[2 * c][2], acc[2 * c][3], ahi[1], alo[1]);
+          split2(acc[2 * c + 1][0], acc[2 * c + 1][1], ahi[2], alo[2]);
+          split2(acc[2 * c + 1][2], acc[2 * c + 1][3], ahi[3], alo[3]);
+          if (g < R) {
+            bfr[0] = *reinterpret_cast<const uint32_t*>(fC + g * LDB + c * 16 + 2 * qd);
+            bfr[1] = *reinterpret_cast<const uint32_t*>(fC + g * LDB + c * 16 + 8 + 2 * qd);
+          }
+          mma_bf16(c4, alo, bfr); mma_bf16(c4, ahi, bfr);
+        }
+        const int src = (g << 2) | (qd >> 1);   // lane 2 qd' + j holds r2 = 2 qd' + j
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const float s0 = __shfl_sync(0xffffffffu, c4[2 * e], src), s1 = __shfl_sync(0xffffffffu, c4[2 * e + 1], src);
+          o[e] = (qd & 1) ? s1 : s0;
+        }
+      }
+      // new checkpoint: anchor (fp32, or bf16 with stochastic rounding) and the fp8 read copy
+      // stochastic-rounding bits: one hash per thread, then a Weyl sequence through a multiply-xorshift per pair
+      const uint32_t seed = hash32(__float_as_uint(fmf[M_LCUR]) ^ (__float_as_uint(fTh[0]) * 0x9e3779b9u) ^ ((uint32_t)slot * 0x85ebca6bu)
+                                   ^ ((uint32_t)(h * THREADS + t) * 0xc2b2ae35u));
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) {
+        const int nn2 = jt * 8 + 2 * qd;
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int p = e ? p1 : p0;
+          const size_t off = (size_t)slot * a.anc_sst + ((size_t)h * D + p) * S + nn2;
+          if constexpr (ANCHOR_F32) *reinterpret_cast<float2*>(reinterpret_cast<float*>(a.anchor) + off) = make_float2(acc[jt][2 * e], acc[jt][2 * e + 1]);
+          else {
+            uint32_t rnd = (seed + (uint32_t)(2 * jt + e) * 0x9e3779b9u) * 0x85ebca6bu;
+            rnd ^= rnd >> 13;
+            *reinterpret_cast<uint32_t*>(reinterpret_cast<__nv_bfloat16*>(a.anchor) + off) = bf16x2_sr(acc[jt][2 * e], acc[jt][2 * e + 1], rnd);
+          }
+        }
+      }
+      if constexpr (READ_FP8) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float m = 0.f;
+#pragma unroll
+          for (int jt = 0; jt < 16; ++jt) m = fmaxf(m, fmaxf(fabsf(acc[jt][2 * e]), fabsf(acc[jt][2 * e + 1])));
+          m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1)); m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+          const float sc = m > 0.f ? m / FP8_MAX : 1.f;
+          const float inv = 1.f / sc;
+          const int p = e ? p1 : p0;
+          __nv_fp8_e4m3* dst = a.rd + (size_t)slot * a.rd_sst + ((size_t)h * D + p) * S;
+#pragma unroll
+          for (int jt = 0; jt < 16; ++jt) {
+            const __nv_fp8x2_storage_t q = __nv_cvt_float2_to_fp8x2(make_float2(acc[jt][2 * e] * inv, acc[jt][2 * e + 1] * inv), __NV_SATFINITE, __NV_E4M3);
+            *reinterpret_cast<__nv_fp8x2_storage_t*>(dst + jt * 8 + 2 * qd) = q;
+          }
+          if (qd == 0) a.rd_scale[(size_t)slot * a.rds_sst + h * D + p] = sc;
+        }
+      }
+      // gated output
+      {
+        __nv_bfloat16* yrow = a.y + ((size_t)fb * H + h) * D;
+        float ys[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int p = e ? p1 : p0;
+          const float xt = bf2f(fX[cur * D + p]), zt = bf2f(fZ[p]);
+          float orr = o[e] + Dh * xt * xp[e][qd];
+          const float zv = zt * sZp[qd * D + p];
+          orr *= __fdividef(zv, 1.f + __expf(-zv));
+          ys[e] = orr * sOp[qd * D + p];
+          ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
+        }
+        if (qd == 0) { yrow[p0] = __float2bfloat16(ys[0]); yrow[p1] = __float2bfloat16(ys[1]); }
+      }
+      // bookkeeping: B'_cur and x_cur become the token before the next window
+      if (t < NA) a.angle[(size_t)slot * a.ang_sst + h * NA + t] = fTh[t];
+      if (t < R * S / 8) {
+        const int r = t / (S / 8), c = t % (S / 8);
+        *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) = *reinterpret_cast<const uint4*>(fBc + r * LDB + c * 8);
+      }
+      if (t >= 64 && t < 64 + D / 8) *reinterpret_cast<uint4*>(a.vp + (size_t)slot * a.vp_sst + h * D + (t - 64) * 8) = *reinterpret_cast<const uint4*>(fX + cur * D + (t - 64) * 8);
+      if (t == 96) { int* cntp = a.cnt + (size_t)slot * a.cnt_sst + h * 2; cntp[0] = 0; cntp[1] = -L; }   // main kernel: skip, restore L
+    __syncthreads();   // buffers reusable
+  }
+}
+
 #ifndef REPLAY_MINB
-#define REPLAY_MINB 4   // 4 CTAs/SM: 128 registers, no spills (5 spills; 3 is ~8% slower on B300)
+#define REPLAY_MINB 5
 #endif
 template <bool ANCHOR_F32, bool READ_FP8>
 __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const Args a) {
   extern __shared__ __align__(128) char smem[];
   const Layout lo(a.L, a.tpc);
   const StageLayout& sl = lo.st;
-  float* sBias = reinterpret_cast<float*>(smem + lo.bias);
-  float* sXp = reinterpret_cast<float*>(smem + lo.xproj);
-  float* sZp = reinterpret_cast<float*>(smem + lo.zproj);
-  float* sOp = reinterpret_cast<float*>(smem + lo.outproj);
-  __half* sCh = reinterpret_cast<__half*>(smem + lo.ch);
   float* sG = reinterpret_cast<float*>(smem + lo.G);
   float* sW = reinterpret_cast<float*>(smem + lo.w);
   int* sSlots = reinterpret_cast<int*>(smem + lo.slots);
   __shared__ float sTh[NA], sCosC[NA], sSinC[NA];
-  __shared__ float sDecay, sLcur;
+  __shared__ float sDecay;
 
   const int H = a.H, h = blockIdx.x, j0 = blockIdx.y, nb = gridDim.y, t = threadIdx.x;
   const int warp = t >> 5, lane = t & 31, g = lane >> 2, qd = lane & 3;
@@ -199,25 +581,25 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
   const int ntok = (a.N - j0 + nb - 1) / nb;
   if (ntok <= 0) return;
 
-  // ---- once per CTA: the head's constants, this CTA's slots, the zero rows
-  for (int i = t; i < 2 * R * S / 4; i += THREADS) {
-    const int qq = i / (R * S / 4), rem = i % (R * S / 4), r = rem / (S / 4), c = (rem % (S / 4)) * 4;
-    cp16(sBias + (qq * R + r) * S + c, (qq ? a.bias_q : a.bias_k) + ((size_t)r * H + h) * S + c);
+  // ---- once per CTA: this thread's projection constants (registers), this CTA's slots, the zero rows
+  float xp[2][R], xq[2], zq[2], oq[2];   // rows p0, p1: x projection (all r), x / z / out projections at r = qd
+#pragma unroll
+  for (int e = 0; e < 2; ++e) {
+    const int p = e ? p1 : p0;
+#pragma unroll
+    for (int r = 0; r < R; ++r) xp[e][r] = __ldg(a.xproj + ((size_t)r * H + h) * D + p);
+    xq[e] = xp[e][qd];
+    zq[e] = __ldg(a.zproj + ((size_t)qd * H + h) * D + p);
+    oq[e] = __ldg(a.outproj + ((size_t)qd * H + h) * D + p);
   }
-  for (int i = t; i < 3 * R * D / 4; i += THREADS) {
-    const int m = i / (R * D / 4), rem = i % (R * D / 4), r = rem / (D / 4), c = (rem % (D / 4)) * 4;
-    const float* src = m == 0 ? a.xproj : m == 1 ? a.zproj : a.outproj;
-    float* dst = m == 0 ? sXp : m == 1 ? sZp : sOp;
-    cp16(dst + r * D + c, src + ((size_t)r * H + h) * D + c);
-  }
-  cp_commit();
+  // the rotary biases of this head, read through L1 by the rotation (thread t < 64: row (t / 8) % 4, 8 columns)
+  const float* bias_row = (t >= R * (HALF / 8) ? a.bias_q : a.bias_k) + ((size_t)((t >> 3) & 3) * H + h) * S + (t & 7) * 8;
   for (int i = t; i < ntok; i += THREADS) sSlots[i] = a.slots[j0 + i * nb];
   if (t < 4 * (S / 8)) {
     const int r = 4 + t / (S / 8), c = t % (S / 8);
 #pragma unroll
     for (int s = 0; s < 2; ++s)
       *reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(smem + lo.stage + s * sl.total + sl.cb) + r * LDB + c * 8) = make_uint4(0, 0, 0, 0);
-    *reinterpret_cast<uint4*>(sCh + r * LDB + c * 8) = make_uint4(0, 0, 0, 0);
   }
   __syncthreads();
   const float Dh = a.Dp[h];
@@ -245,7 +627,7 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
     // rows p0, p1; the mma k order is permuted consistently in C' (a dot product does not care), see the read below
     uint4 q8f[READ_FP8 ? 2 : 1][2];
     if constexpr (READ_FP8) {
-      if (k.valid && k.hc + 1 < k.lim) {
+      if (k.valid && !k.flushed && k.hc + 1 < k.lim) {
         const uint8_t* qsrc = reinterpret_cast<const uint8_t*>(a.rd) + (size_t)k.slot * a.rd_sst + (size_t)h * D * S + qd * 32;
 #pragma unroll
         for (int e = 0; e < 2; ++e)
@@ -259,6 +641,8 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
 
     if (!k.valid) {
       if (t < D) yrow[t] = __float2bfloat16(0.f);
+    } else if (k.flushed) {   // done by the flush kernel: restore the window length
+      if (t == 0) a.cnt[(size_t)k.slot * a.cnt_sst + h * 2 + 1] = -k.lim_raw;
     } else {
       __nv_bfloat16* sBk = reinterpret_cast<__nv_bfloat16*>(stg + sl.bk);
       __nv_bfloat16* sCb = reinterpret_cast<__nv_bfloat16*>(stg + sl.cb);
@@ -268,7 +652,6 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
       const float* sAngSt = reinterpret_cast<const float*>(stg + sl.angst);
       const __nv_bfloat16* sAngP = reinterpret_cast<const __nv_bfloat16*>(stg + sl.angp);
       const int slot = k.slot, hc = k.hc;
-      const bool flush = hc + 1 >= k.lim;
       const int n = hc + 2, cur = n - 1, nrows = n * R, nks = (nrows + 15) / 16;
       const float dt = k.dt, Av = k.A, tr = k.trap;
       const float alpha = __expf(Av * dt), lam = Av * dt, gam = tr * dt, bet = (1.f - tr) * dt * alpha;
@@ -279,42 +662,43 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
         th -= TWO_PI * floorf(th / TWO_PI);
         sTh[t] = th; sincosf(th, &sSinC[t], &sCosC[t]);
       }
-      for (int i = t; i < (nks * 16 - nrows) * (S / 8); i += THREADS) {   // pad rows of the last mma tile: zero
-        const int r = nrows + i / (S / 8), c = i % (S / 8);
-        *reinterpret_cast<uint4*>(sBk + r * LDB + c * 8) = make_uint4(0, 0, 0, 0);
-      }
       // ---- window weights: thread k sums its own prefix of the log-decays (v1's order); token 0 = the checkpoint
-      if (t < n) {
+      for (int tw = t - 32; tw >= 0 && tw < ((n + 15) / 16) * 16; tw += 32) {   // warp 1
         float Lt = 0.f, Lt1 = 0.f, Lc = 0.f;
         for (int kk = 1; kk < cur; ++kk) {
           Lc += sScr[(kk - 1) * 4];
-          if (kk == t) Lt = Lc;
-          if (kk == t + 1) Lt1 = Lc;
+          if (kk == tw) Lt = Lc;
+          if (kk == tw + 1) Lt1 = Lc;
         }
         Lc += lam;
-        if (t == cur) Lt = Lc;
-        if (t + 1 == cur) Lt1 = Lc;
-        const float gk = t == 0 ? 0.f : t == cur ? gam : sScr[(t - 1) * 4 + 1];
+        if (tw == cur) Lt = Lc;
+        if (tw + 1 == cur) Lt1 = Lc;
+        const float gk = tw == 0 ? 0.f : tw == cur ? gam : sScr[(tw - 1) * 4 + 1];
         float wk = gk * __expf(Lc - Lt);
-        if (t + 1 < n) wk += (t + 1 == cur ? bet : sScr[t * 4 + 2]) * __expf(Lc - Lt1);
-        sW[t] = wk;
-        if (t == 0) { sDecay = __expf(Lc); sLcur = Lc; }
+        if (tw + 1 < n) wk += (tw + 1 == cur ? bet : sScr[tw * 4 + 2]) * __expf(Lc - Lt1);
+        sW[tw] = tw < n ? wk : 0.f;
+        if (tw == 0) sDecay = __expf(Lc);
       }
       __syncthreads();
       // ---- B'_cur = rot(B + bias_k), C' = rot(C + bias_q), in place, bf16-rounded (the ring rows are rotated already)
       constexpr int ntask = R * (HALF / 8);
-      for (int i = t; i < 2 * ntask; i += THREADS) {
-        const bool isC = i >= ntask;
-        const int ii = isC ? i - ntask : i;
+      static_assert(2 * ntask <= THREADS, "one rotation task per thread");
+      if (t < 2 * ntask) {
+        const bool isC = t >= ntask;
+        const int ii = isC ? t - ntask : t;
         const int kk = cur, r = (ii >> 3) & 3, j0c = (ii & 7) * 8;
         __nv_bfloat16* row = isC ? sCb + r * LDB : sBk + (kk * R + r) * LDB;
-        const float* bias = sBias + ((isC ? R : 0) + r) * S;
+        float bl[8], bh[8];
+        *reinterpret_cast<float4*>(bl) = __ldg(reinterpret_cast<const float4*>(bias_row));
+        *reinterpret_cast<float4*>(bl + 4) = __ldg(reinterpret_cast<const float4*>(bias_row + 4));
+        *reinterpret_cast<float4*>(bh) = __ldg(reinterpret_cast<const float4*>(bias_row + HALF));
+        *reinterpret_cast<float4*>(bh + 4) = __ldg(reinterpret_cast<const float4*>(bias_row + HALF + 4));
         const uint4 ul = *reinterpret_cast<const uint4*>(row + j0c), uh = *reinterpret_cast<const uint4*>(row + j0c + HALF);
         const __nv_bfloat16* el = reinterpret_cast<const __nv_bfloat16*>(&ul);
         const __nv_bfloat16* eh = reinterpret_cast<const __nv_bfloat16*>(&uh);
         float vl[8], vh[8];
 #pragma unroll
-        for (int q = 0; q < 8; ++q) { vl[q] = bf2f(el[q]) + bias[j0c + q]; vh[q] = bf2f(eh[q]) + bias[j0c + HALF + q]; }
+        for (int q = 0; q < 8; ++q) { vl[q] = bf2f(el[q]) + bl[q]; vh[q] = bf2f(eh[q]) + bh[q]; }
         if (j0c < NA) {
 #pragma unroll
           for (int q = 0; q < 8; ++q) {
@@ -327,21 +711,12 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
         ph.x = pack_bf16(vh[0], vh[1]); ph.y = pack_bf16(vh[2], vh[3]); ph.z = pack_bf16(vh[4], vh[5]); ph.w = pack_bf16(vh[6], vh[7]);
         *reinterpret_cast<uint4*>(row + j0c) = pl;
         *reinterpret_cast<uint4*>(row + j0c + HALF) = ph;
-        if (isC) {   // f16 copy of the bf16-rounded C' (exact)
-          pl.x = bf16x2_to_f16x2(pl.x); pl.y = bf16x2_to_f16x2(pl.y); pl.z = bf16x2_to_f16x2(pl.z); pl.w = bf16x2_to_f16x2(pl.w);
-          ph.x = bf16x2_to_f16x2(ph.x); ph.y = bf16x2_to_f16x2(ph.y); ph.z = bf16x2_to_f16x2(ph.z); ph.w = bf16x2_to_f16x2(ph.w);
-          *reinterpret_cast<uint4*>(sCh + r * LDB + j0c) = pl;
-          *reinterpret_cast<uint4*>(sCh + r * LDB + j0c + HALF) = ph;
-        }
       }
       __syncthreads();
 
-      float xp[2][R];
-#pragma unroll
-      for (int r = 0; r < R; ++r) { xp[0][r] = sXp[r * D + p0]; xp[1][r] = sXp[r * D + p1]; }
       float o[2];
       const float decay = sDecay;
-      if (!flush) {
+      {
         // ---- G = B' C'^T over 16-row tiles of the (k, r) rows
         for (int mt = warp; mt < nks; mt += 4) {
           float gc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -354,8 +729,8 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
           }
           if (qd < 2) {
             const int m0 = mt * 16 + g, m1 = m0 + 8;
-            if (m0 < nrows) { sG[m0 * R + 2 * qd] = gc[0]; sG[m0 * R + 2 * qd + 1] = gc[1]; }
-            if (m1 < nrows) { sG[m1 * R + 2 * qd] = gc[2]; sG[m1 * R + 2 * qd + 1] = gc[3]; }
+            sG[m0 * R + 2 * qd] = gc[0]; sG[m0 * R + 2 * qd + 1] = gc[1];   // rows past nrows: masked readers
+            sG[m1 * R + 2 * qd] = gc[2]; sG[m1 * R + 2 * qd + 1] = gc[3];
           }
         }
         // ---- checkpoint read: oc[p][r2] = sum_s S_c[p][s] C'[r2][s]
@@ -371,8 +746,8 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
             uint32_t af[4], bfr[2];
             af[0] = fp8x2_to_f16x2((uint16_t)(w0 & 0xffffu)); af[1] = fp8x2_to_f16x2((uint16_t)(w1 & 0xffffu));
             af[2] = fp8x2_to_f16x2((uint16_t)(w0 >> 16));    af[3] = fp8x2_to_f16x2((uint16_t)(w1 >> 16));
-            const uint2 cb2 = *reinterpret_cast<const uint2*>(sCh + g * LDB + qd * 32 + st * 4);
-            bfr[0] = cb2.x; bfr[1] = cb2.y;
+            const uint2 cb2 = *reinterpret_cast<const uint2*>(sCb + g * LDB + qd * 32 + st * 4);   // C' rows 4..7: zero
+            bfr[0] = bf16x2_to_f16x2(cb2.x); bfr[1] = bf16x2_to_f16x2(cb2.y);   // exact
             mma_f16(c4, af, bfr);
           }
           const float s0 = a.rd_scale[(size_t)slot * a.rds_sst + h * D + p0], s1 = a.rd_scale[(size_t)slot * a.rds_sst + h * D + p1];
@@ -419,10 +794,8 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
 #pragma unroll
           for (int q = 0; q < 4; ++q) {   // a0: (p0, k, k+1), a1: (p1, ...), a2: (p0, k+8, k+9), a3: (p1, ...)
             const int k0 = ks * 16 + 2 * qd + (q >> 1) * 8, p = (q & 1) ? p1 : p0;
-            const float u0 = k0 < n ? sW[k0] * bf2f(sXb[k0 * D + p]) : 0.f;
-            const float u1 = k0 + 1 < n ? sW[k0 + 1] * bf2f(sXb[(k0 + 1) * D + p]) : 0.f;
-            const float h0 = rbf(u0), h1 = rbf(u1);
-            ahi[q] = pack_bf16(h0, h1); alo[q] = pack_bf16(u0 - h0, u1 - h1);
+            const float v0 = sW[k0] * bf2f(sXb[k0 * D + p]), v1 = sW[k0 + 1] * bf2f(sXb[(k0 + 1) * D + p]);
+            split2(k0 < n ? v0 : 0.f, k0 + 1 < n ? v1 : 0.f, ahi[q], alo[q]);
           }
 #pragma unroll
           for (int T = 0; T < 2; ++T) {   // b0: (k = 2qd, 2qd + 1; col g), b1: (k = 2qd + 8, + 9; col g); col -> (r, r2)
@@ -431,10 +804,8 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
 #pragma unroll
             for (int hb = 0; hb < 2; ++hb) {
               const int k0 = ks * 16 + 2 * qd + hb * 8;
-              const float g0 = k0 < n ? sG[(k0 * R + r) * R + r2] : 0.f;
-              const float g1 = k0 + 1 < n ? sG[((k0 + 1) * R + r) * R + r2] : 0.f;
-              const float h0 = rbf(g0), h1 = rbf(g1);
-              bhi[hb] = pack_bf16(h0, h1); blo[hb] = pack_bf16(g0 - h0, g1 - h1);
+              const float g0 = sG[(k0 * R + r) * R + r2], g1 = sG[((k0 + 1) * R + r) * R + r2];
+              split2(k0 < n ? g0 : 0.f, k0 + 1 < n ? g1 : 0.f, bhi[hb], blo[hb]);
             }
             mma_bf16(wc[T], alo, bhi); mma_bf16(wc[T], ahi, blo); mma_bf16(wc[T], ahi, bhi);
           }
@@ -454,106 +825,6 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
           const float s0 = __shfl_sync(0xffffffffu, v[e][0], src), s1 = __shfl_sync(0xffffffffu, v[e][1], src);
           o[e] = decay * (qd == 0 ? oc[e][0] : qd == 1 ? oc[e][1] : qd == 2 ? oc[e][2] : oc[e][3]) + ((qd & 1) ? s1 : s0);
         }
-      } else {
-        // ---- flush: S = e^L S_anchor + U B' with U[p][(k, r)] = w_k x_k[p] xproj[r][p] (mma, U split hi + lo)
-        float acc[16][4];
-#pragma unroll
-        for (int jt = 0; jt < 16; ++jt) {
-          const int nn2 = jt * 8 + 2 * qd;
-#pragma unroll
-          for (int e = 0; e < 2; ++e) {
-            float2 v;
-            if constexpr (ANCHOR_F32) {
-              const size_t off = (size_t)slot * a.anc_sst + ((size_t)h * D + (e ? p1 : p0)) * S + nn2;
-              v = *reinterpret_cast<const float2*>(reinterpret_cast<const float*>(a.anchor) + off);
-            } else {
-              const size_t off = (size_t)slot * a.anc_sst + ((size_t)h * D + (e ? p1 : p0)) * S + nn2;
-              v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(reinterpret_cast<const __nv_bfloat16*>(a.anchor) + off));
-            }
-            acc[jt][2 * e] = decay * v.x; acc[jt][2 * e + 1] = decay * v.y;
-          }
-        }
-        for (int ks = 0; ks < nks; ++ks) {
-          uint32_t ahi[4], alo[4];
-#pragma unroll
-          for (int q = 0; q < 4; ++q) {
-            const int e = q & 1, kk = ks * 16 + 2 * qd + (q >> 1) * 8, p = e ? p1 : p0;
-            float u[2];
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-              const int m = kk + j, km = m >> 2;
-              const int rr = (2 * qd + j) & 3;
-              const float xpr = rr == 0 ? xp[e][0] : rr == 1 ? xp[e][1] : rr == 2 ? xp[e][2] : xp[e][3];
-              u[j] = m < nrows ? sW[km] * bf2f(sXb[km * D + p]) * xpr : 0.f;
-            }
-            const float h0 = rbf(u[0]), h1 = rbf(u[1]);
-            ahi[q] = pack_bf16(h0, h1); alo[q] = pack_bf16(u[0] - h0, u[1] - h1);
-          }
-#pragma unroll
-          for (int jp = 0; jp < 8; ++jp) {
-            uint32_t bfr[4];
-            ldsm_x4_t(bfr, sBk + (ks * 16 + (mi & 1) * 8 + li) * LDB + jp * 16 + (mi >> 1) * 8);
-            mma_bf16(acc[2 * jp], ahi, bfr); mma_bf16(acc[2 * jp], alo, bfr);
-            mma_bf16(acc[2 * jp + 1], ahi, bfr + 2); mma_bf16(acc[2 * jp + 1], alo, bfr + 2);
-          }
-        }
-        float oo[2][R];
-#pragma unroll
-        for (int e = 0; e < 2; ++e)
-#pragma unroll
-          for (int r2 = 0; r2 < R; ++r2) oo[e][r2] = 0.f;
-#pragma unroll
-        for (int jt = 0; jt < 16; ++jt) {
-          const int nn2 = jt * 8 + 2 * qd;
-#pragma unroll
-          for (int r2 = 0; r2 < R; ++r2) {
-            const float2 cr = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(sCb + r2 * LDB + nn2));
-            oo[0][r2] = fmaf(acc[jt][0], cr.x, fmaf(acc[jt][1], cr.y, oo[0][r2]));
-            oo[1][r2] = fmaf(acc[jt][2], cr.x, fmaf(acc[jt][3], cr.y, oo[1][r2]));
-          }
-        }
-#pragma unroll
-        for (int e = 0; e < 2; ++e) {
-#pragma unroll
-          for (int r2 = 0; r2 < R; ++r2) { oo[e][r2] += __shfl_xor_sync(0xffffffffu, oo[e][r2], 1); oo[e][r2] += __shfl_xor_sync(0xffffffffu, oo[e][r2], 2); }
-          o[e] = qd == 0 ? oo[e][0] : qd == 1 ? oo[e][1] : qd == 2 ? oo[e][2] : oo[e][3];
-        }
-        // ---- new checkpoint: anchor (fp32, or bf16 with stochastic rounding) and the fp8 read copy
-        const uint32_t seed = hash32(__float_as_uint(sLcur) ^ (__float_as_uint(sTh[0]) * 0x9e3779b9u) ^ ((uint32_t)slot * 0x85ebca6bu));
-#pragma unroll
-        for (int jt = 0; jt < 16; ++jt) {
-          const int nn2 = jt * 8 + 2 * qd;
-#pragma unroll
-          for (int e = 0; e < 2; ++e) {
-            const int p = e ? p1 : p0;
-            const size_t off = (size_t)slot * a.anc_sst + ((size_t)h * D + p) * S + nn2;
-            if constexpr (ANCHOR_F32) *reinterpret_cast<float2*>(reinterpret_cast<float*>(a.anchor) + off) = make_float2(acc[jt][2 * e], acc[jt][2 * e + 1]);
-            else {
-              const uint32_t rnd = hash32(((uint32_t)(h * D + p) * S + nn2) ^ seed);
-              __nv_bfloat162 v; v.x = bf16_sr(acc[jt][2 * e], rnd); v.y = bf16_sr(acc[jt][2 * e + 1], rnd >> 16 | rnd << 16);
-              *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(a.anchor) + off) = v;
-            }
-          }
-        }
-        if constexpr (READ_FP8) {
-#pragma unroll
-          for (int e = 0; e < 2; ++e) {
-            float m = 0.f;
-#pragma unroll
-            for (int jt = 0; jt < 16; ++jt) m = fmaxf(m, fmaxf(fabsf(acc[jt][2 * e]), fabsf(acc[jt][2 * e + 1])));
-            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1)); m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
-            const float sc = m > 0.f ? m / FP8_MAX : 1.f;
-            const float inv = 1.f / sc;
-            const int p = e ? p1 : p0;
-            __nv_fp8_e4m3* dst = a.rd + (size_t)slot * a.rd_sst + ((size_t)h * D + p) * S;
-#pragma unroll
-            for (int jt = 0; jt < 16; ++jt) {
-              const __nv_fp8x2_storage_t q = __nv_cvt_float2_to_fp8x2(make_float2(acc[jt][2 * e] * inv, acc[jt][2 * e + 1] * inv), __NV_SATFINITE, __NV_E4M3);
-              *reinterpret_cast<__nv_fp8x2_storage_t*>(dst + jt * 8 + 2 * qd) = q;
-            }
-            if (qd == 0) a.rd_scale[(size_t)slot * a.rds_sst + h * D + p] = sc;
-          }
-        }
       }
 
       // ---- gated MIMO output: lane qd holds r = qd for rows p0, p1
@@ -563,10 +834,10 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
         for (int e = 0; e < 2; ++e) {
           const int p = e ? p1 : p0;
           const float xt = bf2f(sXb[cur * D + p]), zt = bf2f(sZ[p]);
-          float orr = o[e] + Dh * xt * (qd == 0 ? xp[e][0] : qd == 1 ? xp[e][1] : qd == 2 ? xp[e][2] : xp[e][3]);
-          const float zv = zt * sZp[qd * D + p];
+          float orr = o[e] + Dh * xt * xq[e];
+          const float zv = zt * zq[e];
           orr *= __fdividef(zv, 1.f + __expf(-zv));
-          ys[e] = orr * sOp[qd * D + p];
+          ys[e] = orr * oq[e];
           ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
         }
         if (qd == 0) { yrow[p0] = __float2bfloat16(ys[0]); yrow[p1] = __float2bfloat16(ys[1]); }
@@ -574,15 +845,7 @@ __global__ void __launch_bounds__(THREADS, REPLAY_MINB) replay_step_kernel(const
       // ---- state bookkeeping
       int* cntp = a.cnt + (size_t)slot * a.cnt_sst + h * 2;
       if (t < NA) a.angle[(size_t)slot * a.ang_sst + h * NA + t] = sTh[t];
-      if (flush) {
-        if (t < R * S / 8) {   // B'_cur and x_cur become the token before the next window
-          const int r = t / (S / 8), c = t % (S / 8);
-          *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) =
-              *reinterpret_cast<const uint4*>(sBk + (cur * R + r) * LDB + c * 8);
-        }
-        if (t < D / 8) *reinterpret_cast<uint4*>(a.vp + (size_t)slot * a.vp_sst + h * D + t * 8) = *reinterpret_cast<const uint4*>(sXb + cur * D + t * 8);
-        if (t == 0) { cntp[0] = 0; cntp[1] = a.L; }
-      } else {
+      {   // ring append (flush steps are done by replay_flush_kernel)
         if (t < D / 8) *reinterpret_cast<uint4*>(a.xr + (size_t)slot * a.xr_sst + ((size_t)h * a.L + hc) * D + t * 8) = *reinterpret_cast<const uint4*>(sXb + cur * D + t * 8);
         if (t == 0) {
           *reinterpret_cast<float4*>(a.scr + (size_t)slot * a.scr_sst + ((size_t)h * a.L + hc) * 4) = make_float4(lam, gam, bet, 0.f);
@@ -645,12 +908,20 @@ void mamba3_replay_step(torch::Tensor angle, torch::Tensor anchor, c10::optional
   const int smem = Layout(L, a.tpc).total;
   const dim3 grid(H, nb);
   auto stream = c10::cuda::getCurrentCUDAStream();
-  auto launch = [&](auto kernel) {
+  // flush kernel: ~8 tokens of a head per CTA, so about one flush each (the flush targets are staggered)
+  const int nbf = std::max(1, N / REPLAY_FLUSH_TPC), tpcf = (N + nbf - 1) / nbf;
+  const int fsmem = FlushLayout(L, tpcf).total;
+  const dim3 fgrid(H, nbf);
+  auto launch = [&](auto flush_kernel, auto kernel) {
+    cudaFuncSetAttribute(flush_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fsmem);
+    flush_kernel<<<fgrid, THREADS, fsmem, stream>>>(a, tpcf);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     kernel<<<grid, THREADS, smem, stream>>>(a);
   };
   const bool fp8 = rd.has_value();
-  if (f32) { if (fp8) launch(replay_step_kernel<true, true>); else launch(replay_step_kernel<true, false>); }
-  else { if (fp8) launch(replay_step_kernel<false, true>); else launch(replay_step_kernel<false, false>); }
+  if (f32) { if (fp8) launch(replay_flush_kernel<true, true>, replay_step_kernel<true, true>);
+             else launch(replay_flush_kernel<true, false>, replay_step_kernel<true, false>); }
+  else { if (fp8) launch(replay_flush_kernel<false, true>, replay_step_kernel<false, true>);
+         else launch(replay_flush_kernel<false, false>, replay_step_kernel<false, false>); }
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_replay_step); }

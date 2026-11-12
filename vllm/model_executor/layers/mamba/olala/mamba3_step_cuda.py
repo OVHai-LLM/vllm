@@ -130,16 +130,16 @@ def _load_replay():
 
     major, minor = torch.cuda.get_device_capability()
     sm = f"{major}{minor}"
-    return load_extension(
-        f"olala_mamba3_replay_step_sm{sm}",
-        "mamba3_replay_step.cu",
-        ["-O3", "-std=c++17", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
-    )
+    flags = ["-O3", "-std=c++17", f"-gencode=arch=compute_{sm},code=sm_{sm}"]
+    if major == 10:
+        # sm_100a / sm_103a: the flush's stochastic rounding uses the hardware cvt.rs
+        flags = ["-O3", "-std=c++17", f"-gencode=arch=compute_{sm}a,code=sm_{sm}a", "-DREPLAY_HW_SR"]
+    return load_extension(f"olala_mamba3_replay_step_sm{sm}", "mamba3_replay_step.cu", flags)
 
 
-# Resident CTAs per SM the persistent replay kernel sizes its grid for: 4 fit
-# its 128-register / ~44 KB budget (csrc/mamba3_replay_step.cu).
-_REPLAY_CTAS_PER_SM = 4
+# Resident CTAs per SM the persistent replay kernel sizes its grid for: 5 fit
+# its 96-register / ~35 KB budget at L = 8 (csrc/mamba3_replay_step.cu).
+_REPLAY_CTAS_PER_SM = 5
 
 
 def replay_step_supported(num_heads_local, head_dim, d_state, rank, num_angles, ngroups) -> bool:
