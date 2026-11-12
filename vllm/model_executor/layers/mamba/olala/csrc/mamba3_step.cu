@@ -151,6 +151,95 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
     __syncthreads();
     const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
     if constexpr (F32) {
+#ifndef STEP_F32_FMA
+      // ---- tensor-core fp32 step. h_new = alpha h + A Bk with the fp32 accumulator seeded by alpha h (the state never
+      // leaves fp32) and A (k < 4: gamma x xproj, 4 <= k < 8: beta xstate xproj) split into three bf16 terms
+      // hi + mid + lo (24 mantissa bits, as fp32); Bk is bf16 already, so every product is exact in fp32. Then
+      // o = h_new C'^T with h_new split the same way (the m16n8 accumulators of two n8 tiles are the A fragment of a
+      // k16 step). ~fp32-FMA accuracy at a fraction of the issue slots of the scalar loop (which was issue-bound).
+      uint32_t ah[3][4];
+      {
+        float av[2][2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int p = p0 + e * 8;
+          const float xp = bf2f(st.x[p]), xs = bf2f(st.xst[p]);
+#pragma unroll
+          for (int jj = 0; jj < 2; ++jj) {
+            const int k = 2 * qd + jj, r = k & 3;
+            const float xpj = S_.xproj[r * D + p];
+            av[e][jj] = (k < 4) ? gamma * xp * xpj : beta * xs * xpj;
+          }
+        }
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const float h0 = rbf(av[e][0]), h1 = rbf(av[e][1]);
+          const float m0 = rbf(av[e][0] - h0), m1 = rbf(av[e][1] - h1);
+          ah[0][e] = pack_bf16(h0, h1); ah[1][e] = pack_bf16(m0, m1);
+          ah[2][e] = pack_bf16(av[e][0] - h0 - m0, av[e][1] - h1 - m1);
+        }
+#pragma unroll
+        for (int q = 0; q < 3; ++q) { ah[q][2] = 0u; ah[q][3] = 0u; }
+      }
+      float acc[16][4];
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) {
+        const int n = jt * 8 + 2 * qd;
+        const float2 h0 = *reinterpret_cast<const float2*>(st.state + p0 * LDSF + n);
+        const float2 h1 = *reinterpret_cast<const float2*>(st.state + (p0 + 8) * LDSF + n);
+        acc[jt][0] = alpha * h0.x; acc[jt][1] = alpha * h0.y; acc[jt][2] = alpha * h1.x; acc[jt][3] = alpha * h1.y;
+      }
+      const int mi = lane >> 3, li = lane & 7;
+#pragma unroll
+      for (int jp = 0; jp < 8; ++jp) {
+        uint32_t bfr[4];
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(bfr[0]), "=r"(bfr[1]), "=r"(bfr[2]), "=r"(bfr[3]) : "r"(smem_u32(&S_.sBk[(mi & 1) * 8 + li][jp * 16 + (mi >> 1) * 8])));
+#pragma unroll
+        for (int q = 2; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
+      }
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) {   // h_new back into the tile for the coalesced pool store
+        const int n = jt * 8 + 2 * qd;
+        *reinterpret_cast<float2*>(st.state + p0 * LDSF + n) = make_float2(acc[jt][0], acc[jt][1]);
+        *reinterpret_cast<float2*>(st.state + (p0 + 8) * LDSF + n) = make_float2(acc[jt][2], acc[jt][3]);
+      }
+      float oc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        uint32_t bfr[4];
+        ldmatrix_x4(bfr, &S_.sCb[li][c * 16 + (mi & 1) * 8]);
+        const float* v[4] = {&acc[2 * c][0], &acc[2 * c][2], &acc[2 * c + 1][0], &acc[2 * c + 1][2]};
+        uint32_t a3[3][4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const float x0 = v[q][0], x1 = v[q][1];
+          const float h0 = rbf(x0), h1 = rbf(x1), m0 = rbf(x0 - h0), m1 = rbf(x1 - h1);
+          a3[0][q] = pack_bf16(h0, h1); a3[1][q] = pack_bf16(m0, m1); a3[2][q] = pack_bf16(x0 - h0 - m0, x1 - h1 - m1);
+        }
+#pragma unroll
+        for (int q = 2; q >= 0; --q) mma16816(oc, a3[q], bfr);
+      }
+      // oc: rows p0 / p0 + 8, n = 2qd + {0,1} = r on lanes qd < 2 (rows 4..7 of sCb are zero)
+      float ys[2] = {0.f, 0.f};
+      if (qd < 2) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int p = p0 + e * 8;
+          const float xp = bf2f(st.x[p]), zp = bf2f(st.z[p]);
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int r = 2 * qd + j;
+            float orr = oc[e * 2 + j] + Dh * xp * S_.xproj[r * D + p];
+            const float zv = zp * S_.zproj[r * D + p];
+            orr *= __fdividef(zv, 1.f + __expf(-zv));
+            ys[e] += orr * S_.outproj[r * D + p];
+          }
+        }
+      }
+      ys[0] += __shfl_xor_sync(0xffffffffu, ys[0], 1); ys[1] += __shfl_xor_sync(0xffffffffu, ys[1], 1);
+      if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
+#else
       // ---- h_new = alpha h + sum_k A[p][k] Bk[k][s] in fp32 over the mma fragment layout (rows p0, p0+8;
       // columns jt*8 + 2qd + {0,1}); then o[p][r] = sum_s h_new[p][s] C'[r][s], reduced over the 4 qd lanes
       float av[2][8];
@@ -205,6 +294,7 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
         ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
       }
       if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
+#endif
     } else {
     // ---- state update on tensor cores: h_new = alpha h + A Bk, A[p][k] = (k<4: gamma x[p] xproj[k][p]; 4<=k<8: beta xstate[p] xproj[k-4][p])
     uint32_t af[4];

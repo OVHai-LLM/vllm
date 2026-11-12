@@ -419,7 +419,9 @@ def _geodesic_norm_kernel(
     scale = tl.load(scale_ptr).to(tl.float32)
     bias = tl.load(bias_ptr).to(tl.float32)
     theta = tl.minimum(safe_tangent / safe_R, clamp_val)
-    theta = tl.minimum((theta * scale + bias) * inv_depth, clamp_val)
+    # Inductor passes the Python-float args as fp64; keep the row update fp32
+    # (fp64 is ~4x slower here, far more on GPUs with little fp64 throughput).
+    theta = tl.minimum((theta * scale + bias) * inv_depth, clamp_val).to(tl.float32)
 
     out = x * tl.cos(theta) + (g - coeff * x) * (safe_R * tl.sin(theta) / safe_tangent)
     tl.store(

@@ -12,6 +12,7 @@ remains the better choice and ``decode_gemv`` falls back to F.linear.
 """
 
 import os
+from functools import cache
 
 import torch
 import torch.nn.functional as F
@@ -43,10 +44,60 @@ def _gemv_m1_kernel(
     tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=n_mask)
 
 
+@triton.jit
+def _gemv_m1_full_kernel(
+    x_ptr, w_ptr, y_ptr, N, K, stride_wn,
+    BN: tl.constexpr, BK: tl.constexpr,
+):
+    """Whole (padded) K extent per program: every load is in flight at once
+    instead of walking K in a dependent loop."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    n_mask = offs_n < N
+    k_mask = offs_k < K
+    w = tl.load(
+        w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+        mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+    )
+    x = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0)
+    acc = tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)
+    tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=n_mask)
+
+
+@cache
+def is_blackwell() -> bool:
+    return torch.cuda.get_device_capability()[0] >= 10
+
+
+def _decode_gemv_blackwell(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """B300 (weights streamed from HBM, CUDA graphs): the full-K kernel is
+    2.7 us on the latent MoE projections where the K loop takes 4-12 us, and
+    3.8 / 5.1 us on mixer_proj (K = 3072 / 4608) vs 4.5 / 9.0 us. Wide outputs
+    (N >= 4096: in_proj, the TPA projections) are faster on cuBLAS."""
+    N, K = weight.shape
+    bk = triton.next_power_of_2(K)
+    if N >= 4096 or bk > 8192:
+        return F.linear(x, weight)
+    if bk <= 2048:
+        bn, nw = 2, 8
+    elif bk <= 4096:
+        bn, nw = 1, 4
+    else:
+        bn, nw = 2, 2
+    y = torch.empty(1, N, dtype=x.dtype, device=x.device)
+    _gemv_m1_full_kernel[(triton.cdiv(N, bn),)](
+        x, weight, y, N, K, weight.stride(0), BN=bn, BK=bk, num_warps=nw,
+    )
+    return y
+
+
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``; triton at M == 1."""
     if x.shape[0] != 1 or not x.is_cuda or x.dtype != weight.dtype or _DISABLED:
         return F.linear(x, weight)
+    if is_blackwell():
+        return _decode_gemv_blackwell(x, weight)
     N, K = weight.shape
     if K % 128 != 0:
         return F.linear(x, weight)

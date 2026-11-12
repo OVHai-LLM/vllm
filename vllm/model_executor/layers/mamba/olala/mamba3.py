@@ -27,7 +27,11 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import (
+    cat_rows_shared,
+    decode_gemv,
+    is_blackwell,
+)
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
@@ -74,6 +78,15 @@ _STEP_NUM_WARPS = 4
 # ~1 us/layer faster at batch 1, ~26 us/layer slower at batch 256. Dispatch on
 # batch size; each cudagraph capture size takes one consistent branch.
 _FUSE_ROTARY_MAX_BATCH = 64
+
+
+def _fuse_rotary_max_batch() -> int:
+    # On Blackwell the CUDA step (rotary fused, csrc/mamba3_step.cu) beats the
+    # CuteDSL step + separate rotary at every batch: B300, fp32 state, batch
+    # 256: 168 us vs 172 + 13.5 us per layer.
+    if is_blackwell() and cuda_step_enabled():
+        return 1 << 30
+    return _FUSE_ROTARY_MAX_BATCH
 
 # Mamba3 kernels (vendored under ops/mamba3), imported lazily: the prefill
 # kernel needs tilelang and the step kernel the CuTe DSL.
@@ -1076,7 +1089,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         fuse_rotary = (
             kernel_writes_kv
             and self.ngroups == 1
-            and u.shape[0] <= _FUSE_ROTARY_MAX_BATCH
+            and u.shape[0] <= _fuse_rotary_max_batch()
         )
 
         if fuse_rotary:

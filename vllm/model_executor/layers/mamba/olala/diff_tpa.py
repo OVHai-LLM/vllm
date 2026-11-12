@@ -29,7 +29,11 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import (
+    cat_rows_shared,
+    decode_gemv,
+    is_blackwell,
+)
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
@@ -419,9 +423,11 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
-            if n == 1:
+            if n == 1 and not is_blackwell():
                 allp = decode_gemv(hidden_states, w_all)
             else:
+                # also batch 1 on Blackwell: cuBLAS streams the aligned width
+                # faster than the Triton GEMV (5.8 vs 6.3 us; 9.1 unaligned)
                 allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
             q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]

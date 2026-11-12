@@ -884,6 +884,7 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 )
                 OlalaForCausalLMConfig._prefill_cudagraph_sizes(vllm_config)
             else:
+                OlalaForCausalLMConfig._decode_cudagraph_sizes(vllm_config)
                 scheduler_config.enable_chunked_prefill = False
                 scheduler_config.long_prefill_token_threshold = 0
                 # A whole prompt must fit in one batch.
@@ -923,7 +924,35 @@ def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
     logger.info("Olala: piecewise CUDA graphs up to %d tokens (prefill chunks).", budget)
 
 
+def _olala_decode_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
+    """Full decode CUDA graphs up to max_num_seqs.
+
+    vLLM stops capturing at 512, so a larger decode batch runs without the full
+    graph: the opaque Mamba / DiffTPA ops and the layers between them launch
+    eagerly. On B300 with 1024 concurrent 1k/1k requests that is 8.6k tok/s, vs
+    20.9k with graphs up to 1024 (+28 s capture, +0.8 GiB). Skipped when the
+    user set capture sizes; OLALA_DECODE_GRAPHS_MAX caps it (default 2048).
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if cc.max_cudagraph_capture_size is not None:
+        return
+    if cc.cudagraph_capture_sizes is not None:
+        return
+    cap = int(os.environ.get("OLALA_DECODE_GRAPHS_MAX", "2048"))
+    target = min(int(sc.max_num_seqs), cap)
+    if target <= 512:
+        return
+    cc.max_cudagraph_capture_size = target
+    logger.info(
+        "Olala: full decode CUDA graphs up to %d requests (max_num_seqs).", target
+    )
+
+
 OlalaForCausalLMConfig._prefill_cudagraph_sizes = staticmethod(_olala_prefill_cudagraph_sizes)
+OlalaForCausalLMConfig._decode_cudagraph_sizes = staticmethod(
+    _olala_decode_cudagraph_sizes
+)
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
