@@ -49,6 +49,10 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     olala_moe_small,
     moe_cat_shared,
 )
+from vllm.model_executor.layers.mamba.olala.latent_moe_medium import (
+    MEDIUM_BATCH_MAX_TOKENS,
+    olala_moe_medium,
+)
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -286,6 +290,15 @@ class OlalaLatentMoE(nn.Module):
             self._fused_proj and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
         )
 
+        # Medium batches (decode): fused routing/sort, relu^2 in the up GEMM,
+        # top-k sum fused with the shared concat. Unquantized experts only;
+        # OLALA_MOE_MEDIUM=0 disables it.
+        self._medium_path = (
+            self._small_path
+            and quant_config is None
+            and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
+        )
+
         # Registered like the mixers so the MoE call is one opaque custom op
         # and the small/generic dispatch runs inside it (see forward_dispatch).
         self.registry_name = f"{prefix}.latent_moe"
@@ -321,6 +334,20 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
                 w13_scale=getattr(re, "w13_scale", None),
                 w2_scale=getattr(re, "w2_scale", None),
+            )
+        if self._medium_path and hidden_states.shape[0] <= MEDIUM_BATCH_MAX_TOKENS:
+            w_in, w_out = self._small_path_weights()
+            re = self.experts.routed_experts
+            return olala_moe_medium(
+                hidden_states,
+                router_logits,
+                self.gate.e_score_correction_bias,
+                w_in,
+                w_out,
+                re.w13_weight,
+                re.w2_weight,
+                self.top_k,
+                self.routed_scaling_factor,
             )
         if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
