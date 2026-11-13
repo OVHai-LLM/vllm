@@ -43,6 +43,11 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.mamba.olala.decode_gemv import olala_linear
+from vllm.model_executor.layers.mamba.olala.geo_linear import (
+    GEO_FUSE,
+    GEO_LINEAR_MAX_TOKENS,
+    geo_linear,
+)
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     FUSED_PROJ_MAX_TOKENS,
     SMALL_BATCH_MAX_TOKENS,
@@ -333,14 +338,39 @@ class OlalaLatentMoE(nn.Module):
         )
         return out.reshape(orig_shape)
 
+    def forward_geo(
+        self, residual: torch.Tensor, g: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``h = self._geo(residual, g)`` and the MoE of ``h``, with the
+        geodesic update fused into the entry GEMM at decode sizes."""
+        h = torch.empty_like(residual)
+        out = torch.ops.vllm.olala_latent_moe(
+            residual, None, _encode_layer_name(self.registry_name), g, h
+        )
+        return h, out
+
+    def forward_dispatch_geo(
+        self, residual: torch.Tensor, g: torch.Tensor, h_out: torch.Tensor
+    ) -> torch.Tensor:
+        if residual.shape[0] <= GEO_LINEAR_MAX_TOKENS:
+            y = geo_linear(
+                residual, g, self._geo, self._entry_weight(), h_out, torch.float32
+            )
+            n_in = y.shape[1] - self.num_experts
+            return self.forward_dispatch(h_out, y[:, n_in:], x_in=y[:, :n_in])
+        self._geo(residual, g, out=h_out)
+        return self.forward_dispatch(h_out, None)
+
     def forward_dispatch(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        x_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._entry_path and self._entry_w is None:
             # First call is the profiling run, before CUDA graph capture: a
             # cache built during capture would live in a graph's private pool.
             self._entry_weight()
-        x_in = None
         if router_logits is None:
             m = hidden_states.shape[0]
             small_max = (
@@ -545,10 +575,14 @@ class OlalaGeodesicNorm(nn.Module):
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi / 4.0
 
-    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, g: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if not (x.is_cuda and x.stride(-1) == 1 and g.stride(-1) == 1):
-            return self.forward_native(x, g)
-        out = torch.empty_like(x)
+            y = self.forward_native(x, g)
+            return y if out is None else out.copy_(y)
+        if out is None:
+            out = torch.empty_like(x)
         D = x.shape[-1]
         _geodesic_norm_kernel[(x.numel() // D,)](
             x,
@@ -720,6 +754,21 @@ class OlalaMonoBlock(nn.Module):
             and self.mixer_proj.bias is None
         )
         self.lns = 1.0 / math.sqrt(layer_idx + 1) if config.layer_norm_scaling else 1.0
+        # OLALA_GEO_FUSE=1: the geodesic updates run inside the next
+        # projection (MoE entry GEMM; next Mamba layer's in_proj), see
+        # geo_linear.py. The block then returns the pending (residual, g).
+        self.geo_fuse = (
+            GEO_FUSE
+            and self.is_geodesic
+            and self.lns == 1.0
+            and isinstance(self.mlp, OlalaLatentMoE)
+            and self.mlp._entry_path
+            and self.mlp._medium_path
+            and get_pp_group().world_size == 1
+        )
+        if self.geo_fuse:
+            # Plain reference, not a submodule (keeps parameter names unique).
+            object.__setattr__(self.mlp, "_geo", self.geodesic_mixer)
         if config.use_completed_p:
             depth_ratio = len(config.layers_config) / config.base_depth
             self.a = float(depth_ratio ** (-config.completed_p_alpha))
@@ -737,15 +786,24 @@ class OlalaMonoBlock(nn.Module):
         *,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """Flat-token forward: ``(N, D)`` in, ``(N, D)`` out."""
+        pending: tuple[torch.Tensor, "OlalaGeodesicNorm"] | None = None,
+    ):
+        """Flat-token forward: ``(N, D)`` in, ``(N, D)`` out. With geo_fuse,
+        ``hidden_states`` is the previous block's residual, ``pending`` its
+        (MLP output, geodesic module) still to apply, and the block returns
+        ``(residual, pending)`` the same way."""
         n = hidden_states.shape[0]
 
-        residual = hidden_states
-        x = self.input_norm(hidden_states)
-        if self.lns != 1.0:
-            x = self.lns * x
-        y_mix = self._mix(x, positions)  # (N, H_local * D)
+        if pending is not None and self.layer_type == "M" and self.geo_fuse:
+            residual, y_mix = self.mixer.forward_geo(hidden_states, pending[0])
+        else:
+            if pending is not None:
+                hidden_states = pending[1](hidden_states, pending[0])
+            residual = hidden_states
+            x = self.input_norm(hidden_states)
+            if self.lns != 1.0:
+                x = self.lns * x
+            y_mix = self._mix(x, positions)  # (N, H_local * D)
         if self.use_gate:
             g_all, _ = self.gate_proj(x)
             g = self.gate_act(
@@ -759,6 +817,9 @@ class OlalaMonoBlock(nn.Module):
         else:
             y_mix, _ = self.mixer_proj(y_mix)
 
+        if self.geo_fuse:
+            residual, y_mlp = self.mlp.forward_geo(residual, y_mix)
+            return residual, (y_mlp, self.geodesic_mlp)
         if self.is_geodesic:
             hidden_states = self.geodesic_mixer(residual, y_mix)
         else:
@@ -806,6 +867,14 @@ class OlalaModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             len(config.layers_config), build_block, prefix=f"{prefix}.layers"
         )
+        # geo_fuse: a Mamba mixer applies the previous block's MLP geodesic
+        # update inside its in_proj (see OlalaMonoBlock.forward).
+        for prev, layer in zip(
+            self.layers[self.start_layer : self.end_layer - 1],
+            self.layers[self.start_layer + 1 : self.end_layer],
+        ):
+            if prev.geo_fuse and layer.geo_fuse and layer.layer_type == "M":
+                object.__setattr__(layer.mixer, "_pre_geo", prev.geodesic_mlp)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
@@ -850,8 +919,19 @@ class OlalaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        pending = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions=positions, hidden_states=hidden_states)
+            if layer.geo_fuse:
+                hidden_states, pending = layer(
+                    positions=positions, hidden_states=hidden_states, pending=pending
+                )
+            else:
+                if pending is not None:
+                    hidden_states = pending[1](hidden_states, pending[0])
+                    pending = None
+                hidden_states = layer(positions=positions, hidden_states=hidden_states)
+        if pending is not None:
+            hidden_states = pending[1](hidden_states, pending[0])
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})

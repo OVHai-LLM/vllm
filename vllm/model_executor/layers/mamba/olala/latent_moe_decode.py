@@ -265,8 +265,13 @@ def _olala_latent_moe(
     hidden: torch.Tensor,
     router_logits: torch.Tensor | None,
     layer_name: LayerNameType,
+    g: torch.Tensor | None = None,
+    h_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if g is not None:
+        # hidden is the residual; h_out receives geodesic(hidden, g).
+        return layer.forward_dispatch_geo(hidden, g, h_out)
     return layer.forward_dispatch(hidden, router_logits)
 
 
@@ -274,6 +279,8 @@ def _olala_latent_moe_fake(
     hidden: torch.Tensor,
     router_logits: torch.Tensor | None,
     layer_name: LayerNameType,
+    g: torch.Tensor | None = None,
+    h_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden)
 
@@ -281,6 +288,6 @@ def _olala_latent_moe_fake(
 direct_register_custom_op(
     op_name="olala_latent_moe",
     op_func=_olala_latent_moe,
-    mutates_args=[],
+    mutates_args=["h_out"],
     fake_impl=_olala_latent_moe_fake,
 )

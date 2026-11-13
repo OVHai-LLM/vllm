@@ -33,6 +33,10 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import (
     is_blackwell,
 )
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
+from vllm.model_executor.layers.mamba.olala.geo_linear import (
+    GEO_LINEAR_MAX_TOKENS,
+    geo_linear,
+)
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
     cuda_step_supported,
@@ -368,6 +372,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
         self._in_proj_cat_w: torch.Tensor | None = None
         self._raw_consts: tuple[torch.Tensor, ...] | None = None
+        self._pre_geo: nn.Module | None = None
         self._in_proj_cat_ok = (
             tp == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None
         )
@@ -530,10 +535,60 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         )
         return out
 
-    def _forward_impl(self, hidden_states: torch.Tensor, out: torch.Tensor) -> None:
+    def forward_geo(
+        self, residual: torch.Tensor, g: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``h = self._pre_geo(residual, g)`` (the previous block's geodesic
+        update) and the mixer of ``h``; at decode sizes the update runs inside
+        the in_proj GEMM (geo_linear.py). Returns ``(h, mixer output)``."""
+        h = torch.empty_like(residual)
+        out = torch.empty(
+            residual.shape[0],
+            self.nheads_local * self.headdim,
+            device=residual.device,
+            dtype=residual.dtype,
+        )
+        torch.ops.vllm.olala_mamba3(
+            residual, out, _encode_layer_name(self.prefix), g, h
+        )
+        return h, out
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        out: torch.Tensor,
+        g: torch.Tensor | None = None,
+        h_out: torch.Tensor | None = None,
+    ) -> None:
         _lazy_import_kernels()
 
         attn_metadata = get_forward_context().attn_metadata
+        if g is not None:
+            md = attn_metadata[self.prefix] if attn_metadata is not None else None
+            n = hidden_states.shape[0]
+            if (
+                md is not None
+                and md.num_prefills == 0
+                and md.spec is None
+                and self._replay is None
+                and n <= GEO_LINEAR_MAX_TOKENS
+                and self._raw_step_ok(tuple(self.kv_cache[:4]))
+            ):
+                cat = geo_linear(
+                    hidden_states, g, self._pre_geo, self._in_proj_cat_weight(),
+                    h_out, hidden_states.dtype,
+                )
+                n1 = self.in_proj.weight.shape[0]
+                ndt = md.num_decode_tokens
+                self._decode_raw_step(
+                    None, out[:ndt], md.state_indices_tensor[: md.num_decodes],
+                    tuple(self.kv_cache[:4]),
+                    zxdt_bc=(cat[:ndt, :n1], cat[:ndt, n1:]),
+                )
+                return
+            self._pre_geo(hidden_states, g, out=h_out)
+            hidden_states = h_out
+
         if attn_metadata is None:
             self._dry_run_prefill(hidden_states, out)
             return
@@ -1230,10 +1285,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self._raw_consts = self._raw_const_values()
         return self._raw_consts
 
-    def _decode_raw_step(self, u, out, slots, pools) -> None:
+    def _decode_raw_step(self, u, out, slots, pools, zxdt_bc=None) -> None:
         """in_proj GEMM then the CUDA step, which also does the x/z split,
-        the A/dt/trap activations and the B/C norms (one launch less)."""
-        zxdt, bc = self._decode_in_proj(u)
+        the A/dt/trap activations and the B/C norms (one launch less).
+        ``zxdt_bc``: the in_proj output, when already computed."""
+        zxdt, bc = self._decode_in_proj(u) if zxdt_bc is None else zxdt_bc
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
         H, D = self.nheads_local, self.headdim
         if out.is_contiguous():
@@ -1280,16 +1336,20 @@ def olala_mamba3(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
+    g: torch.Tensor | None = None,
+    h_out: torch.Tensor | None = None,
 ) -> None:
     layer_name = _resolve_layer_name(layer_name)
     self = get_forward_context().no_compile_layers[layer_name]
-    self._forward_impl(hidden_states, output)
+    self._forward_impl(hidden_states, output, g, h_out)
 
 
 def olala_mamba3_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
+    g: torch.Tensor | None = None,
+    h_out: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -1297,6 +1357,6 @@ def olala_mamba3_fake(
 direct_register_custom_op(
     op_name="olala_mamba3",
     op_func=olala_mamba3,
-    mutates_args=["output"],
+    mutates_args=["output", "h_out"],
     fake_impl=olala_mamba3_fake,
 )
