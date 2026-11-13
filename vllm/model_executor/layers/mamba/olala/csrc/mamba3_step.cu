@@ -64,6 +64,11 @@ struct Args {
   const __nv_bfloat16* angp; const int* slots; __nv_bfloat16* y; int B;
   long long bc_bstride, angp_stride;   // batch stride of Bm/Cm (elements), row stride of angle_proj
   long long ssm_sst, kp_sst, vp_sst, ang_sst;   // slot (dim 0) strides of the pools in elements (pages may be padded)
+  // raw mode (preamble fused): x/z/dt/A/trap come from the head-interleaved in_proj rows zxdt, Bm/Cm are the raw
+  // in_proj_dyn rows, RMS-normed here with gains wb/wc
+  int raw; const __nv_bfloat16* zxdt; long long zxdt_stride; const float* dt_bias; float a_floor;
+  const float* wb; const float* wc; float eps;
+  int pdl;   // launched with programmatic stream serialization: wait for the producer grid before reading its output
 };
 
 template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, Stage<F32>& st, int item, int t) {
@@ -86,7 +91,13 @@ template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, St
     cp16(st.cm + t * 8, a.Cm + (size_t)b * a.bc_bstride + t * 8);
   } else {
     const int q = t - 64;   // 64 threads: x, z, xst (8 chunks each), angp (4), angst (8 fp32 chunks)
-    if (q < 8) cp16(st.x + q * 8, a.x + ((size_t)b * H + h) * D + q * 8);
+    if (q < 16 && a.raw) {   // head rows of zxdt are 2D+3 elements: not 16B aligned, plain loads
+      const __nv_bfloat16* src = a.zxdt + (size_t)b * a.zxdt_stride + (size_t)h * (2 * D + 3) + (q < 8 ? D : 0) + (q & 7) * 8;
+      __nv_bfloat16* dst = (q < 8 ? st.x : st.z) + (q & 7) * 8;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) dst[i] = src[i];
+    }
+    else if (q < 8) cp16(st.x + q * 8, a.x + ((size_t)b * H + h) * D + q * 8);
     else if (q < 16) cp16(st.z + (q - 8) * 8, a.z + ((size_t)b * H + h) * D + (q - 8) * 8);
     else if (q < 24) cp16(st.xst + (q - 16) * 8, a.vp + (size_t)srow * a.vp_sst + (size_t)h * D + (q - 16) * 8);
     else if (q < 28) cp16(st.angp + (q - 24) * 8, a.angp + (size_t)b * a.angp_stride + (q - 24) * 8);
@@ -110,6 +121,8 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
     cp16(S_.bias_q + r * S + c * 4, a.bias_q + ((size_t)r * H + h) * S + c * 4); }
   if (t < 64) { const int r = t >> 4, c = t & 15; cp16(S_.xproj + r * D + c * 4, a.xproj + ((size_t)r * H + h) * D + c * 4); cp16(S_.outproj + r * D + c * 4, a.outproj + ((size_t)r * H + h) * D + c * 4); }
   else { const int q = t - 64, r = q >> 4, c = q & 15; cp16(S_.zproj + r * D + c * 4, a.zproj + ((size_t)r * H + h) * D + c * 4); }
+  // the per-head constants above are weights; everything below may be the previous kernel's output
+  if (a.pdl) asm volatile("griddepcontrol.wait;\n" ::: "memory");
   int b0 = blockIdx.x / H;
   auto item_of = [&](int k) { return (b0 + k * nb_stride) * H + h; };   // token index b = b0 + k*nb_stride
   const int nk = (a.B - b0 + nb_stride - 1) / nb_stride;                 // items of this CTA
@@ -121,11 +134,34 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
     { const int pf = k + kStages<F32> - 1; if (pf < nk) issue_item(a, S_.st[pf % kStages<F32>], item_of(pf), t); cp_commit(); }
     const int b = item / H;
     const int slot = a.slots[b]; const bool valid = slot >= 0 && slot < a.P;
-    const float dt = a.dt[b * H + h], A = a.A[b * H + h], trap = a.trap[b * H + h];
+    float dt, A, trap;
+    if (a.raw) {   // _decode_preamble_kernel: softplus (identity above 20), clamp, sigmoid
+      const __nv_bfloat16* hp = a.zxdt + (size_t)b * a.zxdt_stride + (size_t)h * (2 * D + 3) + 2 * D;
+      const float v = bf2f(hp[0]) + a.dt_bias[h], av = bf2f(hp[1]), tv = bf2f(hp[2]);
+      dt = v > 20.f ? v : logf(1.f + expf(v));
+      A = fminf(-(av > 20.f ? av : logf(1.f + expf(av))), -a.a_floor);
+      trap = 1.f / (1.f + expf(-tv));
+    } else { dt = a.dt[b * H + h]; A = a.A[b * H + h]; trap = a.trap[b * H + h]; }
     const float Dh = a.Dp[h];
     cp_wait<kStages<F32> - 1>();
     __syncthreads();
     Stage<F32>& st = S_.st[k % kStages<F32>];
+    if (a.raw) {   // _bc_norm_kernel: per (B/C, r) row RMS norm + gain, bf16-rounded; warp w owns rows 2w, 2w+1
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
+        const int row = warp * 2 + rr;   // 0..3 B rows, 4..7 C rows
+        __nv_bfloat16* v = (row < R ? st.bm : st.cm) + (row & 3) * S + lane * 4;
+        const float* w = (row < R ? a.wb : a.wc) + lane * 4;
+        float f[4], ss = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { f[i] = bf2f(v[i]); ss += f[i] * f[i]; }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float inv = 1.f / sqrtf(ss / S + a.eps);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = __float2bfloat16(f[i] * inv * w[i]);
+      }
+    }
     const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
     // ---- preamble: angles, bias + rotary on B/C (bf16-rounded)
     // carried phase wrapped to [0, 2*pi) as in prefill: unwrapped it grows with the context and loses fp32 precision
@@ -402,7 +438,9 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
 void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tensor v_pool, torch::Tensor angle_pool,
                     torch::Tensor A, torch::Tensor Bm, torch::Tensor Cm, torch::Tensor Dp, torch::Tensor x, torch::Tensor dt, torch::Tensor trap,
                     torch::Tensor xproj, torch::Tensor zproj, torch::Tensor outproj, torch::Tensor z, torch::Tensor bias_q, torch::Tensor bias_k,
-                    torch::Tensor angle_proj, torch::Tensor slots, torch::Tensor y, int64_t ctas_per_sm) {
+                    torch::Tensor angle_proj, torch::Tensor slots, torch::Tensor y, int64_t ctas_per_sm,
+                    std::optional<torch::Tensor> raw_zxdt, std::optional<torch::Tensor> raw_dt_bias, double a_floor,
+                    std::optional<torch::Tensor> raw_wb, std::optional<torch::Tensor> raw_wc, double eps, bool pdl) {
   Args a;
   a.ssm = ssm_pool.data_ptr(); a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
   a.angle = angle_pool.data_ptr<float>(); a.P = ssm_pool.size(0); a.A = A.data_ptr<float>(); a.Bm = reinterpret_cast<const __nv_bfloat16*>(Bm.data_ptr()); a.Cm = reinterpret_cast<const __nv_bfloat16*>(Cm.data_ptr());
@@ -420,6 +458,15 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   TORCH_CHECK(Bm.stride(1) == S && Bm.stride(2) == 1 && Cm.stride(0) == Bm.stride(0) && Cm.stride(1) == S && angle_proj.stride(1) == 1);
   TORCH_CHECK((Bm.stride(0) * 2) % 16 == 0 && (angle_proj.stride(0) * 2) % 16 == 0, "B/C batch stride and angle_proj row stride must be 16B aligned");
   TORCH_CHECK((f32 || ssm_pool.dtype() == torch::kBFloat16) && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
+  a.pdl = pdl ? 1 : 0;
+  a.raw = 0; a.zxdt = nullptr; a.zxdt_stride = 0; a.dt_bias = nullptr; a.a_floor = 0.f; a.wb = a.wc = nullptr; a.eps = 0.f;
+  if (raw_zxdt.has_value()) {
+    const auto& zx = *raw_zxdt;
+    TORCH_CHECK(zx.stride(1) == 1 && raw_dt_bias->dtype() == torch::kFloat32 && raw_wb->dtype() == torch::kFloat32 && raw_wc->dtype() == torch::kFloat32);
+    a.raw = 1; a.zxdt = reinterpret_cast<const __nv_bfloat16*>(zx.data_ptr()); a.zxdt_stride = zx.stride(0);
+    a.dt_bias = raw_dt_bias->data_ptr<float>(); a.a_floor = (float)a_floor; a.wb = raw_wb->data_ptr<float>(); a.wc = raw_wc->data_ptr<float>(); a.eps = (float)eps;
+    a.B = zx.size(0);
+  }
   auto launch = [&](auto kernel, int smem) {
     static bool attr[2] = {false, false};
     if (!attr[f32]) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr[f32] = true; }
@@ -427,9 +474,18 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
     int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, kernel, THREADS, smem);
     const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
     const int items = a.B * H; int grid = std::min<int>(items, nsm * cps); grid = std::max(H, (grid / H) * H);
-    kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
+    if (a.pdl) {
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(grid); cfg.blockDim = dim3(THREADS); cfg.dynamicSmemBytes = smem; cfg.stream = c10::cuda::getCurrentCUDAStream();
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr; cfg.numAttrs = 1;
+      cudaLaunchKernelEx(&cfg, kernel, a);
+    } else {
+      kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
+    }
   };
   if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
   else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda, py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"), py::arg("A"), py::arg("Bm"), py::arg("Cm"), py::arg("Dp"), py::arg("x"), py::arg("dt"), py::arg("trap"), py::arg("xproj"), py::arg("zproj"), py::arg("outproj"), py::arg("z"), py::arg("bias_q"), py::arg("bias_k"), py::arg("angle_proj"), py::arg("slots"), py::arg("y"), py::arg("ctas_per_sm"), py::arg("raw_zxdt") = py::none(), py::arg("raw_dt_bias") = py::none(), py::arg("a_floor") = 0.0, py::arg("raw_wb") = py::none(), py::arg("raw_wc") = py::none(), py::arg("eps") = 0.0, py::arg("pdl") = false); }

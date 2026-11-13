@@ -38,6 +38,7 @@ from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_supported,
     mamba3_replay_step,
     mamba3_step_cuda,
+    mamba3_step_cuda_raw,
     refresh_f32_cache,
     replay_step_supported,
 )
@@ -70,6 +71,8 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 # exactly one CTA owns each (batch, head) row — the precondition for letting
 # the kernel store the new B/x key/value states itself (``update_kv_state``).
 _STEP_TILE_D = 64
+# OLALA_RAW_STEP=0 keeps the separate decode preamble launch.
+_RAW_STEP = os.environ.get("OLALA_RAW_STEP", "1") != "0"
 _STEP_NUM_WARPS = 4
 
 # Fusing bias+rotary into the step kernel avoids materializing the per-head
@@ -364,6 +367,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         )
 
         self._in_proj_cat_w: torch.Tensor | None = None
+        self._raw_consts: tuple[torch.Tensor, ...] | None = None
         self._in_proj_cat_ok = (
             tp == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None
         )
@@ -679,6 +683,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         autotuning run before the KV cache is allocated."""
         if self._in_proj_cat_ok:
             self._in_proj_cat_weight()  # decode-time weight cache, before KV sizing
+        self._decode_const_weights()
+        self._raw_step_consts()
         n = h.shape[0]
         if n == 0 or torch.cuda.is_current_stream_capturing():
             out.zero_()
@@ -925,6 +931,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 ):
                     dst.copy_(src)
             refresh_f32_cache()
+            if self._raw_consts is not None:
+                for dst, src in zip(self._raw_consts, self._raw_const_values()):
+                    dst.copy_(src)
             # Normally a self-copy (cat_rows_shared): only matters if a reload
             # rebound param.data instead of copying into it.
             w = self._in_proj_cat_w
@@ -1057,6 +1066,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # norm. They also keep DT/trap in fp32 where the eager chain rounded
         # to bf16 per op, so greedy output can differ within bf16 noise.
         fuse_preamble = self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)
+        if fuse_preamble and self._raw_step_ok(pools):
+            self._decode_raw_step(u, out, slots, pools)
+            return
         if fuse_preamble:
             zxdt, bc = self._decode_in_proj(u)
             n_tok = u.shape[0]
@@ -1181,6 +1193,62 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             if self._postgate_norm:
                 y = self.output_norm(y)
             out.copy_(y.to(out.dtype))
+
+    def _raw_step_ok(self, pools) -> bool:
+        """The CUDA step can run the decode preamble itself."""
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        return (
+            _RAW_STEP
+            and self._in_proj_cat_ok
+            and not self._postgate_norm
+            and self.headdim <= _STEP_TILE_D
+            and cuda_step_enabled()
+            and self.nheads_local == 48
+            and self.headdim == 64
+            and self.d_state == 128
+            and self.mimo_dim == 4
+            and self.num_rope_angles == 32
+            and ssm_pool.dtype in (torch.float32, torch.bfloat16)
+            and k_pool.dtype == torch.bfloat16
+            and v_pool.dtype == torch.bfloat16
+            and angle_pool.dtype == torch.float32
+        )
+
+    def _raw_const_values(self) -> tuple[torch.Tensor, ...]:
+        zc = 1.0 if self.B_norm.norm.zero_centered else 0.0
+        return (
+            self.dt_bias.detach().float().contiguous(),
+            (self.B_norm.norm.weight.detach().float() + zc).contiguous(),
+            (self.C_norm.norm.weight.detach().float() + zc).contiguous(),
+        )
+
+    def _raw_step_consts(self) -> tuple[torch.Tensor, ...]:
+        """fp32 dt_bias and B/C gains for the raw step. Built eagerly (see
+        _dry_run_prefill): a first build during CUDA graph capture would
+        allocate them from a graph's private pool."""
+        if self._raw_consts is None:
+            self._raw_consts = self._raw_const_values()
+        return self._raw_consts
+
+    def _decode_raw_step(self, u, out, slots, pools) -> None:
+        """in_proj GEMM then the CUDA step, which also does the x/z split,
+        the A/dt/trap activations and the B/C norms (one launch less)."""
+        zxdt, bc = self._decode_in_proj(u)
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
+        H, D = self.nheads_local, self.headdim
+        if out.is_contiguous():
+            y = out.view(out.shape[0], H, D)
+        else:
+            y = torch.empty(out.shape[0], H, D, dtype=out.dtype, device=out.device)
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        dt_bias, wb, wc = self._raw_step_consts()
+        mamba3_step_cuda_raw(
+            ssm_pool, k_pool, v_pool, angle_pool, zxdt, bc, dt_bias, self.A_floor,
+            wb, wc, self.B_norm.norm.eps, self.D, xpj, zpj, outpj, bias_q, bias_k,
+            slots.to(torch.int32).contiguous(), y,
+        )
+        if not out.is_contiguous():
+            out.copy_(y.flatten(1))
 
     def _decode_replay(
         self,

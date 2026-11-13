@@ -21,6 +21,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
@@ -31,6 +32,8 @@ from vllm.utils.torch_utils import (
 )
 
 SMALL_BATCH_MAX_TOKENS = 8
+# With the medium path available (bf16 experts) it wins from 6 tokens on B300.
+SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM = 5
 # Above this many tokens the concatenated-projection path costs more in
 # activation traffic than it saves in launches (measured on 24k prefills).
 FUSED_PROJ_MAX_TOKENS = int(os.environ.get("OLALA_FUSED_PROJ_MAX_TOKENS", "512"))
@@ -46,6 +49,8 @@ def _latent_moe_up_kernel(
     w1_ptr,      # [E, N, D] bf16, or int8 with per-row scales
     w1s_ptr,     # [E, N] fp32 scales (int8 weights only)
     h_ptr,       # [M*K, N] bf16 out
+    stride_xm,   # row stride of x (fp32 or bf16; rounded to bf16 on load)
+    stride_lm,   # row stride of the logits
     E: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
@@ -53,6 +58,7 @@ def _latent_moe_up_kernel(
     BD: tl.constexpr,
     K: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Expert up-projection + relu^2 for one (token, slot k, N-block).
 
@@ -61,12 +67,14 @@ def _latent_moe_up_kernel(
     every program from the 256 logits: cheaper than a separate launch. The
     nb == 0 program of each (token, k) publishes the id and weight for the
     down kernel."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0)  # m * K + k
     nb = tl.program_id(1)
     m = pid // K
     k_slot = pid % K
     offs_e = tl.arange(0, E)
-    sc = 1.0 / (1.0 + tl.exp(-tl.load(logits_ptr + m * E + offs_e)))
+    sc = 1.0 / (1.0 + tl.exp(-tl.load(logits_ptr + m * stride_lm + offs_e)))
     sb = sc + tl.load(bias_ptr + offs_e)
     # Padded batch rows carry garbage/NaN logits; NaN never compares equal to
     # the max, which would select index E and read past the expert weights.
@@ -91,7 +99,7 @@ def _latent_moe_up_kernel(
     acc = tl.zeros([BN], dtype=tl.float32)
     for d0 in range(0, D, BD):
         offs_d = d0 + tl.arange(0, BD)
-        x = tl.load(x_ptr + m * D + offs_d).to(tl.float32)
+        x = tl.load(x_ptr + m * stride_xm + offs_d).to(tl.bfloat16).to(tl.float32)
         w = tl.load(w1_ptr + e64 * N * D + offs_n[:, None] * D + offs_d[None, :])
         acc += tl.sum(w.to(tl.float32) * x[None, :], axis=1)
     if HAS_SCALE:
@@ -115,7 +123,10 @@ def _latent_moe_down_partial_kernel(
     BN: tl.constexpr,
     BD: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)  # m * K + k
     nb = tl.program_id(1)
     e = tl.load(ids_ptr + row).to(tl.int64)
@@ -143,7 +154,10 @@ def _latent_moe_epilogue_kernel(
     S: tl.constexpr,
     BS: tl.constexpr,
     K: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     m = tl.program_id(0)
     nb = tl.program_id(1)
     offs = nb * BS + tl.arange(0, BS)
@@ -154,7 +168,7 @@ def _latent_moe_epilogue_kernel(
         tl.store(cat_ptr + m * (D2 + S) + offs, (acc * scale).to(tl.bfloat16))
     else:
         so = offs - D2
-        v = tl.load(s_ptr + m * S_LD + so).to(tl.float32)
+        v = tl.load(s_ptr + m * S_LD + so).to(tl.bfloat16).to(tl.float32)
         v = tl.maximum(v, 0.0)
         tl.store(cat_ptr + m * (D2 + S) + offs, (v * v).to(tl.bfloat16))
 
@@ -205,10 +219,13 @@ def olala_moe_small(
     routed_scale: float,
     w13_scale: torch.Tensor | None = None,  # [E, inter] fp32 (int8 w13)
     w2_scale: torch.Tensor | None = None,   # [E, latent] fp32 (int8 w2)
+    x_in: torch.Tensor | None = None,       # precomputed hidden @ w_in.T
 ) -> torch.Tensor:
     """Small-batch latent MoE. ``w_in``/``w_out`` are the cached concatenations
     of the latent and shared-expert projections (see OlalaLatentMoE). int8
-    expert weights (experts_int8) are dequantized per row in the kernels."""
+    expert weights (experts_int8) are dequantized per row in the kernels.
+    ``x_in`` (fp32 or bf16, any row stride) replaces the input GEMV; it is
+    rounded to bf16 on load, like a bf16 GEMM output."""
     M = hidden.shape[0]
     dev = hidden.device
     E, N1, D1 = w13.shape
@@ -218,32 +235,35 @@ def olala_moe_small(
     topk_w = torch.empty(M, top_k, dtype=torch.float32, device=dev)
     topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=dev)
 
-    x_in = decode_gemv(hidden, w_in)                 # [M, D1 + S]: latent | shared pre-act
-    latent = x_in[:, :D1].contiguous()
+    if x_in is None:
+        x_in = decode_gemv(hidden, w_in)  # [M, D1 + S]: latent | shared pre-act
     h = torch.empty(M * top_k, N1, dtype=hidden.dtype, device=dev)
     q13 = w13.dtype == torch.int8
     q2 = w2.dtype == torch.int8
     _latent_moe_up_kernel[(M * top_k, N1 // 16)](
-        latent, router_logits, e_score_bias, topk_ids, topk_w, w13,
-        w13_scale if q13 else topk_w, h,
+        x_in, router_logits, e_score_bias, topk_ids, topk_w, w13,
+        w13_scale if q13 else topk_w, h, x_in.stride(0), router_logits.stride(0),
         E=E, D=D1, N=N1, BN=16, BD=64, K=top_k, HAS_SCALE=q13, num_warps=4,
+        **pdl_kwargs(),
     )
     part = torch.empty(M * top_k, D2, dtype=torch.float32, device=dev)
     _latent_moe_down_partial_kernel[(M * top_k, D2 // 8)](
         h, topk_ids, topk_w, w2, w2_scale if q2 else topk_w, part,
         N1=N1, D2=D2, BN=8, BD=256, HAS_SCALE=q2, num_warps=4,
+        **pdl_kwargs(),
     )
     cat = torch.empty(M, D2 + S, dtype=hidden.dtype, device=dev)
     _latent_moe_epilogue_kernel[(M, (D2 + S) // 128)](
         part, x_in[:, D1:], cat, routed_scale, x_in.stride(0),
         D2=D2, S=S, BS=128, K=top_k, num_warps=1,
+        **pdl_kwargs(),
     )
     return decode_gemv(cat, w_out)                    # shared + fc2(routed), one GEMV
 
 
 def _olala_latent_moe(
     hidden: torch.Tensor,
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
@@ -252,7 +272,7 @@ def _olala_latent_moe(
 
 def _olala_latent_moe_fake(
     hidden: torch.Tensor,
-    router_logits: torch.Tensor,
+    router_logits: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     return torch.empty_like(hidden)

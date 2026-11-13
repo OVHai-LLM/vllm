@@ -602,9 +602,9 @@ class TransferTopology:
         """
         if isinstance(layer_spec, MambaSpec):
             # Register the whole kv cache shared tensor, including
-            # SSM/Conv.
-            conv, ssm = cache
-            return [conv]
+            # SSM/Conv: the first state view starts at the page base (any
+            # number of states, e.g. Olala Mamba-3's angle/ssm/k/v).
+            return [cache[0]]
 
         # Check may be hacky but it's matching
         # `_update_hybrid_attention_mamba_layout`.

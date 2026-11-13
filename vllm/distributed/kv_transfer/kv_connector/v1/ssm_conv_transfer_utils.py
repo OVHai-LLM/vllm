@@ -103,6 +103,26 @@ class MambaConvSplitInfo:
         return offsets
 
 
+def _olala_mamba3_split(mamba_spec: MambaSpec, local_tp: int) -> MambaConvSplitInfo:
+    """Olala Mamba-3 has no conv state: its page holds (angle, ssm, k, v[, ...])
+    contiguously. The angle state (nh, n_angles) takes the place of the single
+    "conv" region and the remaining states form one "temporal" region, which
+    is a whole-page copy. Equal TP on P and D only (no head re-sharding)."""
+    if local_tp != 1:
+        raise NotImplementedError("Olala Mamba-3 transfer supports TP=1 only.")
+    sizes = [
+        torch.Size(shape).numel() * torch.tensor([], dtype=dtype).element_size()
+        for shape, dtype in zip(mamba_spec.shapes, mamba_spec.dtypes)
+    ]
+    rows, cols = mamba_spec.shapes[0]
+    return MambaConvSplitInfo(
+        conv_rows=cols,
+        local_proj_dims=(rows,),
+        conv_dtype_size=sizes[0] // (rows * cols),
+        ssm_sizes=(sizes[0], sum(sizes[1:])),
+    )
+
+
 def derive_mamba_conv_split(
     mamba_spec: MambaSpec,
     local_tp: int,
@@ -122,6 +142,8 @@ def derive_mamba_conv_split(
         MambaConvSplitInfo with per-rank sub-projection dims, conv_rows,
         conv_dtype_size, and ssm_sizes (conv_state_bytes, ssm_state_bytes).
     """
+    if mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA3:
+        return _olala_mamba3_split(mamba_spec, local_tp)
     _supported = (
         MambaAttentionBackendEnum.MAMBA1,
         MambaAttentionBackendEnum.MAMBA2,

@@ -206,3 +206,64 @@ def test_token_shift_decode_parity(n: int, npad: int):
         # holds; only their non-participation in live rows matters, asserted
         # above. Their own outputs are discarded by the caller.
         assert torch.isfinite(ks_f[real:].float()).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("n", [1, 16, 37])
+@pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
+def test_cuda_step_fused_preamble_parity(n: int, ssm_dtype: torch.dtype):
+    """The CUDA step reading the raw in_proj rows (preamble fused) must match
+    the preamble kernel followed by the step."""
+    from vllm.model_executor.layers.mamba.olala.mamba3 import (
+        _decode_preamble_bc_kernel,
+    )
+    from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
+        cuda_step_enabled,
+        mamba3_step_cuda,
+        mamba3_step_cuda_raw,
+    )
+
+    if not cuda_step_enabled():
+        pytest.skip("CUDA step unavailable")
+    torch.manual_seed(n)
+    dev = "cuda"
+    H, D, S, R, NA, P = 48, 64, 128, 4, 32, 64
+    n1 = H * (2 * D + 3)
+    cat = torch.randn(n, n1 + 2 * R * S + NA, device=dev).bfloat16()
+    zxdt, bc = cat[:, :n1], cat[:, n1:]
+    dt_bias = torch.randn(H, device=dev) * 0.5
+    wb = torch.randn(S, device=dev) * 0.1
+    wc = torch.randn(S, device=dev) * 0.1
+    a_floor, eps = 1e-4, 1e-5
+
+    ssm = torch.randn(P, H, D, S, device=dev).to(ssm_dtype) * 0.1
+    kp = torch.randn(P, R, H, S, device=dev).bfloat16()
+    vp = torch.randn(P, H, D, device=dev).bfloat16()
+    ang = torch.rand(P, H, NA, device=dev) * 6.0
+    f = lambda *s: torch.randn(*s, device=dev) * 0.2  # noqa: E731
+    bias_q, bias_k = f(R, H, S), f(R, H, S)
+    xpj, zpj, outpj, Dp = f(R, H, D), f(R, H, D), f(R, H, D), f(H)
+    slots = torch.randperm(P, device=dev)[:n].to(torch.int32)
+
+    x = torch.empty(n, H, D, dtype=torch.bfloat16, device=dev)
+    z = torch.empty_like(x)
+    A = torch.empty(n, H, device=dev)
+    DT, trap = torch.empty_like(A), torch.empty_like(A)
+    bn_cn = torch.empty(n, 2, R, S, dtype=torch.bfloat16, device=dev)
+    _decode_preamble_bc_kernel[(n * H + n * 2 * R,)](
+        zxdt, x, z, A, DT, trap, dt_bias, a_floor, H, zxdt.stride(0),
+        bc, bn_cn, wb, wc, eps, R * S, R, bc.stride(0), n * H,
+        D=D, S=S, ZERO_CENTERED=True,
+    )
+    pools_ref = [t.clone() for t in (ssm, kp, vp, ang)]
+    y_ref = torch.empty(n, H, D, dtype=torch.bfloat16, device=dev)
+    mamba3_step_cuda(*pools_ref, A, bn_cn[:, 0], bn_cn[:, 1], Dp, x, DT, trap,
+                     xpj, zpj, outpj, z, bias_q, bias_k, bc[:, 2 * R * S :],
+                     slots, y_ref)
+    pools = [t.clone() for t in (ssm, kp, vp, ang)]
+    y = torch.empty_like(y_ref)
+    mamba3_step_cuda_raw(*pools, zxdt, bc, dt_bias, a_floor, wb + 1.0, wc + 1.0, eps,
+                         Dp, xpj, zpj, outpj, bias_q, bias_k, slots, y)
+    torch.testing.assert_close(y.float(), y_ref.float(), atol=2e-2, rtol=2e-2)
+    for a, b in zip(pools, pools_ref):
+        torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)

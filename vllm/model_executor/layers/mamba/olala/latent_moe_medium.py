@@ -25,6 +25,7 @@ import torch
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     _latent_moe_epilogue_kernel,
 )
+from vllm.model_executor.layers.mamba.olala.pdl import pdl_kwargs
 from vllm.triton_utils import tl, triton
 
 MEDIUM_BATCH_MAX_TOKENS = 512
@@ -42,8 +43,11 @@ def _route_topk_kernel(
     K: tl.constexpr,
     KP: tl.constexpr,
     RB: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Sigmoid scores ranked by score + bias; weights renormalized over the top k."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     offs_e = tl.arange(0, E)
     offs_k = tl.arange(0, KP)
     rows = tl.program_id(0) * RB + tl.arange(0, RB)
@@ -53,7 +57,10 @@ def _route_topk_kernel(
         mask=rmask[:, None],
         other=0.0,
     )
-    sc = 1.0 / (1.0 + tl.exp(-lg))
+    # Padded CUDA-graph rows can hold NaN logits. Scoring them 0 keeps the k
+    # winners distinct (ranked by the bias alone): a repeated expert would
+    # overflow its RCAP-row list in _compact_kernel and corrupt other rows.
+    sc = tl.where(lg != lg, 0.0, 1.0 / (1.0 + tl.exp(-lg)))
     sb = sc + tl.load(bias_ptr + offs_e)[None, :]
     sb = tl.where(sb != sb, float("-inf"), sb)
     kid = tl.zeros([RB, KP], dtype=tl.int32)
@@ -69,7 +76,7 @@ def _route_topk_kernel(
         kid = tl.where(sel, idx[:, None], kid)
         kw = tl.where(sel, w[:, None], kw)
         sb = tl.where(hit, float("-inf"), sb)
-    kw = kw / tl.sum(kw, axis=1)[:, None]
+    kw = kw / tl.maximum(tl.sum(kw, axis=1), 1e-20)[:, None]
     m2 = rmask[:, None] & (offs_k[None, :] < K)
     o = rows[:, None] * K + offs_k[None, :]
     tl.store(ids_ptr + o, kid, mask=m2)
@@ -84,9 +91,12 @@ def _compact_kernel(
     MK,
     RCAP,
     QP: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """One program per expert: the list of entries routed to it (no padding, no
     global sort; any number of rows per expert)."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     e = tl.program_id(0)
     q = tl.arange(0, QP)
     hit = (tl.load(ids_ptr + q, mask=q < MK, other=-1) == e).to(tl.int32)
@@ -114,10 +124,13 @@ def _moe_gemm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Program (row block, N block). Row blocks enumerate every expert's rows in
     BLOCK_SIZE_M chunks (prefix sum over the per-expert counts, done in each
     program), so a heavily routed expert spreads over several programs."""
+    if PDL:
+        tl.extra.cuda.gdc_wait()
     num_pid_n = N // BLOCK_SIZE_N
     pid = tl.program_id(0)
     pid_m = pid // num_pid_n
@@ -144,6 +157,7 @@ def _moe_gemm_kernel(
     for k in range(0, Kd // BLOCK_SIZE_K):
         a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
         b = tl.load(b_ptrs)
+        a = a.to(b.dtype)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
@@ -341,11 +355,13 @@ def moe_routed_medium(
         KP=triton.next_power_of_2(top_k),
         RB=RB,
         num_warps=4,
+        **pdl_kwargs(),
     )
     _compact_kernel[(E,)](
-        ids, rows, cnt, MK, M, QP=max(triton.next_power_of_2(MK), 16), num_warps=4
+        ids, rows, cnt, MK, M, QP=max(triton.next_power_of_2(MK), 16), num_warps=4,
+        **pdl_kwargs(),
     )
-    h = torch.empty(MK, N1, dtype=latent.dtype, device=dev)
+    h = torch.empty(MK, N1, dtype=w13.dtype, device=dev)
     nbm = E + triton.cdiv(MK, up_cfg["BLOCK_SIZE_M"])
     _moe_gemm_kernel[(nbm * (N1 // up_cfg["BLOCK_SIZE_N"]),)](
         latent,
@@ -363,6 +379,7 @@ def moe_routed_medium(
         TOPK=top_k,
         UP=True,
         **up_cfg,
+        **pdl_kwargs(),
     )
     part = torch.empty(MK, D2, dtype=torch.float32, device=dev)
     nbm = E + triton.cdiv(MK, down_cfg["BLOCK_SIZE_M"])
@@ -382,6 +399,7 @@ def moe_routed_medium(
         TOPK=top_k,
         UP=False,
         **down_cfg,
+        **pdl_kwargs(),
     )
     return part
 
@@ -396,15 +414,15 @@ def olala_moe_medium(
     w2: torch.Tensor,  # [E, latent, inter]
     top_k: int,
     routed_scale: float,
+    x_in: torch.Tensor | None = None,  # precomputed hidden @ w_in.T (fp32 or bf16)
 ) -> torch.Tensor:
     """Medium-batch latent MoE: shared(x) + fc2(scale * sum_k w_k * E_k(fc1(x)))."""
     M = hidden.shape[0]
     D1 = w13.shape[2]
     D2 = w2.shape[1]
     S = w_in.shape[0] - D1
-    x_in = torch.nn.functional.linear(
-        hidden, w_in
-    )  # [M, D1 + S]: latent | shared pre-act
+    if x_in is None:
+        x_in = torch.nn.functional.linear(hidden, w_in)  # [M, D1 + S]
     part = moe_routed_medium(x_in[:, :D1], router_logits, e_score_bias, w13, w2, top_k)
     cat = torch.empty(M, D2 + S, dtype=hidden.dtype, device=hidden.device)
     _latent_moe_epilogue_kernel[(M, (D2 + S) // 128)](
@@ -418,5 +436,6 @@ def olala_moe_medium(
         BS=128,
         K=top_k,
         num_warps=1,
+        **pdl_kwargs(),
     )
     return torch.nn.functional.linear(cat, w_out)

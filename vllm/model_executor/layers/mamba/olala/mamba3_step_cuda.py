@@ -22,6 +22,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
+from vllm.model_executor.layers.mamba.olala.pdl import pdl_enabled
 
 logger = init_logger(__name__)
 
@@ -118,7 +119,26 @@ def mamba3_step_cuda(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, t
     Dp = _fp32(Dp)
     A, dt, trap = _as_f32(A), _as_f32(dt), _as_f32(trap)
     _load().step(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
-                 bias_q, bias_k, angle_proj, slots, y, ctas_per_sm)
+                 bias_q, bias_k, angle_proj, slots, y, ctas_per_sm, pdl=pdl_enabled())
+
+
+def mamba3_step_cuda_raw(ssm_pool, k_pool, v_pool, angle_pool, zxdt, bc, dt_bias,
+                         a_floor, wb, wc, eps, Dp, xproj, zproj, outproj, bias_q,
+                         bias_k, slots, y, ctas_per_sm: int = 4) -> None:
+    """Step with the decode preamble fused (``_decode_preamble_bc_kernel``):
+    ``zxdt`` is the raw head-interleaved in_proj output (N, H*(2D+3)) and
+    ``bc`` the raw in_proj_dyn output (N, 2*R*S + angles), both row views.
+    ``dt_bias`` and the B/C norm gains ``wb``/``wc`` (``+ 1`` already applied
+    when zero-centered) must be fp32 tensors that outlive CUDA graphs."""
+    R, S = 4, 128
+    B = bc[:, : R * S].unflatten(1, (R, S))
+    C = bc[:, R * S : 2 * R * S].unflatten(1, (R, S))
+    angle_proj = bc[:, 2 * R * S :]
+    Dp = _fp32(Dp)
+    _load().step(ssm_pool, k_pool, v_pool, angle_pool, Dp, B, C, Dp, zxdt, Dp, Dp,
+                 xproj, zproj, outproj, zxdt, bias_q, bias_k, angle_proj, slots, y,
+                 ctas_per_sm, zxdt, dt_bias, float(a_floor), wb, wc, float(eps),
+                 pdl_enabled())
 
 
 # -- ReplaySSM (csrc/mamba3_replay_step.cu) ----------------------------------

@@ -46,6 +46,7 @@ from vllm.model_executor.layers.mamba.olala.decode_gemv import olala_linear
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     FUSED_PROJ_MAX_TOKENS,
     SMALL_BATCH_MAX_TOKENS,
+    SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM,
     olala_moe_small,
     moe_cat_shared,
 )
@@ -298,6 +299,16 @@ class OlalaLatentMoE(nn.Module):
             and quant_config is None
             and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
         )
+        # Decode batches (small / medium paths): the router GEMM is merged
+        # into the input GEMM inside the op. Needs the bf16 router weight that
+        # GateLinear keeps on Hopper / Blackwell. OLALA_MOE_ENTRY=0 disables.
+        self._entry_w: torch.Tensor | None = None
+        self._entry_path = (
+            self._small_path
+            and self.gate.weight.dtype == torch.bfloat16
+            and self.gate.weight.dtype == self.fc1_latent_proj.weight.dtype
+            and os.environ.get("OLALA_MOE_ENTRY", "1") != "0"
+        )
 
         # Registered like the mixers so the MoE call is one opaque custom op
         # and the small/generic dispatch runs inside it (see forward_dispatch).
@@ -310,6 +321,12 @@ class OlalaLatentMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         hidden_states = x.reshape(-1, orig_shape[-1])
+        if self._entry_path:
+            # The router runs inside the op, merged with the input GEMM.
+            out = torch.ops.vllm.olala_latent_moe(
+                hidden_states, None, _encode_layer_name(self.registry_name)
+            )
+            return out.reshape(orig_shape)
         router_logits, _ = self.gate(hidden_states)
         out = torch.ops.vllm.olala_latent_moe(
             hidden_states, router_logits, _encode_layer_name(self.registry_name)
@@ -317,9 +334,38 @@ class OlalaLatentMoE(nn.Module):
         return out.reshape(orig_shape)
 
     def forward_dispatch(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor | None
     ) -> torch.Tensor:
-        if self._small_path and hidden_states.shape[0] <= SMALL_BATCH_MAX_TOKENS:
+        if self._entry_path and self._entry_w is None:
+            # First call is the profiling run, before CUDA graph capture: a
+            # cache built during capture would live in a graph's private pool.
+            self._entry_weight()
+        x_in = None
+        if router_logits is None:
+            m = hidden_states.shape[0]
+            small_max = (
+                SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM
+                if self._medium_path
+                else SMALL_BATCH_MAX_TOKENS
+            )
+            if m <= small_max or (self._medium_path and m <= MEDIUM_BATCH_MAX_TOKENS):
+                # One GEMM for [fc1_latent ; shared_up ; router] with fp32
+                # output: the logits match GateLinear's bf16 x bf16 -> fp32,
+                # and the kernels round x_in to bf16 on load, i.e. exactly a
+                # bf16 GEMM output.
+                y = torch.mm(
+                    hidden_states, self._entry_weight().T, out_dtype=torch.float32
+                )
+                n_in = y.shape[1] - self.num_experts
+                x_in, router_logits = y[:, :n_in], y[:, n_in:]
+            else:
+                router_logits, _ = self.gate(hidden_states)
+        small_max = (
+            SMALL_BATCH_MAX_TOKENS_WITH_MEDIUM
+            if self._medium_path
+            else SMALL_BATCH_MAX_TOKENS
+        )
+        if self._small_path and hidden_states.shape[0] <= small_max:
             w_in, w_out = self._small_path_weights()
             re = self.experts.routed_experts
             return olala_moe_small(
@@ -334,6 +380,7 @@ class OlalaLatentMoE(nn.Module):
                 self.routed_scaling_factor,
                 w13_scale=getattr(re, "w13_scale", None),
                 w2_scale=getattr(re, "w2_scale", None),
+                x_in=x_in,
             )
         if self._medium_path and hidden_states.shape[0] <= MEDIUM_BATCH_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
@@ -348,6 +395,7 @@ class OlalaLatentMoE(nn.Module):
                 re.w2_weight,
                 self.top_k,
                 self.routed_scaling_factor,
+                x_in=x_in,
             )
         if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
@@ -389,10 +437,24 @@ class OlalaLatentMoE(nn.Module):
             self._small_w = (w_in, w_out)
         return self._small_w
 
+    def _entry_weight(self) -> torch.Tensor:
+        """``[fc1_latent ; shared_up ; router]`` for the merged entry GEMM."""
+        if self._entry_w is None:
+            w_in, _ = self._small_path_weights()
+            self._entry_w = torch.cat([w_in, self.gate.weight], 0).contiguous()
+        return self._entry_w
+
     def refresh_weight_caches(self) -> None:
         """Recompute the concatenated small-path projections into their
         existing storage (CUDA graphs bake their addresses; see the Mamba3
         mixer's refresh_weight_caches)."""
+        if self._entry_w is not None:
+            with torch.inference_mode():
+                n_in = self._entry_w.shape[0] - self.num_experts
+                w_fc1 = self.fc1_latent_proj.weight
+                w_up = self.shared_experts.up_proj.weight
+                self._entry_w[:n_in].copy_(torch.cat([w_fc1, w_up]))
+                self._entry_w[n_in:].copy_(self.gate.weight)
         if self._small_w is None:
             return
         w_in, w_out = self._small_w
