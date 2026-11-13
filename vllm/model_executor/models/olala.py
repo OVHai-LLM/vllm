@@ -55,6 +55,10 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     olala_moe_small,
     moe_cat_shared,
 )
+from vllm.model_executor.layers.mamba.olala.latent_moe_updown import (
+    UPDOWN_ENABLED,
+    olala_moe_updown,
+)
 from vllm.model_executor.layers.mamba.olala.latent_moe_medium import (
     MEDIUM_BATCH_MAX_TOKENS,
     olala_moe_medium,
@@ -415,7 +419,8 @@ class OlalaLatentMoE(nn.Module):
         if self._medium_path and hidden_states.shape[0] <= MEDIUM_BATCH_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
             re = self.experts.routed_experts
-            return olala_moe_medium(
+            medium = olala_moe_updown if UPDOWN_ENABLED else olala_moe_medium
+            return medium(
                 hidden_states,
                 router_logits,
                 self.gate.e_score_correction_bias,
