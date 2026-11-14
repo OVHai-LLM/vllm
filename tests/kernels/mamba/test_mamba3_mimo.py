@@ -260,3 +260,119 @@ def test_decode_phase_matches_prefill_long_context():
         assert got.abs().max() < 2 * torch.pi + 1e-3, f"{name}: phase not wrapped"
         assert _wrapped_err(got[0], ref) < 1e-4, name
         assert _wrapped_err(got[0], prefill[0].double()) < 1e-4, name
+
+
+def _hybrid_inputs(T: int, seed: int = 0) -> list:
+    """Arguments 0..13 of mamba3_mimo_hybrid_pools at the scales seen in Olala."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rn(*s, scale=1.0):
+        return torch.randn(*s, device="cuda", generator=g) * scale
+
+    dt = torch.rand(H, T, device="cuda", generator=g) * 0.4
+    adt = -dt * torch.rand(H, 1, device="cuda", generator=g) * 3
+    q, k = rn(T, R, N).bfloat16(), rn(T, R, N).bfloat16()
+    v, z = rn(T, H, P, scale=0.1).bfloat16(), rn(T, H, P, scale=0.1).bfloat16()
+    angles, trap = rn(T, A, scale=0.3), rn(H, T).bfloat16()
+    q_bias, k_bias = rn(H, R, N), rn(H, R, N)
+    psi, phi, zeta, d = (
+        rn(H, R, P, scale=0.5),
+        rn(H, R, P, scale=0.5),
+        rn(H, R, P),
+        rn(H),
+    )
+    return [q, k, v, z, angles, dt, adt, trap, q_bias, k_bias, psi, phi, zeta, 5 * d]
+
+
+def _hybrid_ref(args: list, a: int, b: int):
+    """fp64 token-by-token recurrence of one sequence [a, b) from a zero state:
+    outputs (b - a, H, P) and the final state (H, P, N)."""
+    import math
+
+    Q, K, V, Z, ang, DT, ADT, Trap, qb, kb, psi, phi, zeta, D = (
+        x.double() for x in args
+    )
+    Q, K, V, Z, ang = Q[a:b], K[a:b], V[a:b], Z[a:b], ang[a:b]
+    DT, ADT, Trap = DT[:, a:b], ADT[:, a:b], Trap[:, a:b]
+    nq = N // 4
+    th = (torch.tanh(ang)[:, None, :] * math.pi * DT.T[:, :, None]).cumsum(0)
+    c, s = torch.cos(th)[:, :, None], torch.sin(th)[:, :, None]
+
+    def rot(X, bias):
+        x = X[:, None] + bias[None]
+        y = x.clone()
+        x0, x2 = x[..., :nq], x[..., 2 * nq : 3 * nq]
+        y[..., :nq], y[..., 2 * nq : 3 * nq] = c * x0 - s * x2, s * x0 + c * x2
+        return y
+
+    qh, kh, pv = rot(Q, qb), rot(K, kb), V[:, :, None, :] * psi[None]
+    gam = DT * torch.sigmoid(Trap)
+    ts = gam.clone()
+    ts[:, :-1] += DT[:, 1:] * torch.sigmoid(-Trap[:, 1:])
+    gate = phi[None] * torch.nn.functional.silu(Z[:, :, None, :] * zeta[None])
+    st = torch.zeros(H, N, P, dtype=torch.float64, device="cuda")
+    out = torch.empty(b - a, H, P, dtype=torch.float64, device="cuda")
+    for t in range(b - a):
+        kv = torch.einsum("hrn,hrp->hnp", kh[t], pv[t])
+        dec = torch.exp(ADT[:, t])[:, None, None]
+        y = torch.einsum("hrn,hnp->hrp", qh[t], dec * st + gam[:, t, None, None] * kv)
+        st = dec * st + ts[:, t, None, None] * kv
+        out[t] = ((y + D[:, None, None] * pv[t]) * gate[t]).sum(1)
+    return out, st.transpose(1, 2)
+
+
+def _hybrid_run(args: list, lens: list[int], init: list[bool], tc: bool, monkeypatch):
+    from vllm.model_executor.layers.mamba.ops.mamba3 import mimo_ssd
+
+    monkeypatch.setattr(mimo_ssd, "_SCAN_TC", tc)
+    T, ns = sum(lens), len(lens)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    pools = [
+        torch.randn(ns, H, A, device="cuda", generator=g),
+        torch.randn(ns, H, P, N, device="cuda", generator=g) * 0.1,
+        torch.randn(ns, R, H, N, device="cuda", generator=g).bfloat16(),
+        torch.randn(ns, H, P, device="cuda", generator=g).bfloat16(),
+    ]
+    has_init = torch.tensor(init, device="cuda") if any(init) else None
+    out = torch.empty(T, H, P, device="cuda", dtype=torch.bfloat16)
+    cu = [0] + torch.tensor(lens).cumsum(0).tolist()
+    slots = torch.arange(ns, device="cuda", dtype=torch.int32)
+    mimo_ssd.mamba3_mimo_hybrid_pools(*args, cu, pools, slots, has_init, out)
+    return out.float(), pools
+
+
+def _rel(x: torch.Tensor, ref: torch.Tensor) -> float:
+    return ((x.double() - ref).norm() / ref.norm()).item()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or current_platform.get_device_capability().major != 10,
+    reason="tcgen05 prefill kernels are sm_100 / sm_103 only",
+)
+@torch.inference_mode()
+def test_hybrid_prefill_tcgen05_vs_fp64(monkeypatch):
+    """The tcgen05 output pass and chunk-local states (B300) are at least as
+    close to the fp64 recurrence as the TileLang / Triton path they replace,
+    for several packed sequences of uneven length (sub-block and chunk tails),
+    and agree with it when sequences resume from pool states."""
+    lens = [77, 300, 161]
+    args = _hybrid_inputs(sum(lens))
+    errs = {}
+    for tc in (False, True):
+        out, pools = _hybrid_run(args, lens, [False] * 3, tc, monkeypatch)
+        eo = es = 0.0
+        for i, (a, b) in enumerate(zip([0, 77, 377], [77, 377, 538])):
+            ro, rs = _hybrid_ref(args, a, b)
+            eo, es = max(eo, _rel(out[a:b], ro)), max(es, _rel(pools[1][i], rs))
+        errs[tc] = (eo, es)
+    assert errs[True][0] < 1e-2 and errs[True][1] < 1e-2, errs
+    assert errs[True][0] < 1.25 * errs[False][0] + 1e-3, errs
+    assert errs[True][1] < 1.25 * errs[False][1] + 1e-3, errs
+
+    init = [True, False, True]
+    o_tl, p_tl = _hybrid_run(args, lens, init, False, monkeypatch)
+    o_tc, p_tc = _hybrid_run(args, lens, init, True, monkeypatch)
+    assert _rel(o_tc, o_tl.double()) < 2e-2
+    for x, y in zip(p_tc, p_tl):
+        assert _rel(x.float(), y.double()) < 2e-2

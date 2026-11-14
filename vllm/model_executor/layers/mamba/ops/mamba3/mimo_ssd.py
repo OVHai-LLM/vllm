@@ -17,13 +17,14 @@ Pipeline of ``mamba3_mimo_hybrid_pools`` (chunks of LS = 128 tokens never cross 
 tile are token-major t*R + r):
   0. ``_ssd_prep``        (chunk, head): per-token chunk-local log-decay cumsum (and its 16-token-group
      variants), trapezoid scales, chunk-local phase cumsum; chunk totals.
-  1. chunk-local states: CUDA ``chunk_state`` (olala/csrc/mamba3_scan_prefill.cu, sm90) or the Triton
-     ``_ssd_chunk_state``.
+  1. chunk-local states: CUDA ``chunk_state`` (olala/csrc/mamba3_scan_prefill.cu, sm90 wgmma;
+     mamba3_scan_prefill_tc.cu, sm100 / sm103 tcgen05) or the Triton ``_ssd_chunk_state``.
   2. ``_ssd_state_pass_pool`` (head, sequence): serial over chunks, S_in[c] = state entering chunk c,
      read from / written back to the request's pool slot; a chunk's local state is rotated by the
      phase prefix (rot(a + b) = rot(a) rot(b)).
   3. outputs: every chunk is an independent virtual sequence starting from S_in[c]: CUDA ``scan``
-     (sm90, wgmma) or the TileLang ``mamba_mimo_fwd_v2`` kernel (``OLALA_TL_V2=0``: v1).
+     (sm90 wgmma; sm100 / sm103 tcgen05 with 32-token groups, ``OLALA_SCAN_TC=0`` to skip) or the
+     TileLang ``mamba_mimo_fwd_v2`` kernel (``OLALA_TL_V2=0``: v1).
   4. ``_ssd_pool_tail``: final angle / K / V of every sequence into its pool slot.
 Rotary columns are four NQ = N/4 wide groups: g0/g2 rotate together, g1/g3 do not.
 """
@@ -45,6 +46,27 @@ _SCAN_EXT = None
 
 def _scan_cuda_ok(dev) -> bool:
     return _SCAN_CUDA and torch.cuda.get_device_capability(dev) == (9, 0)
+
+
+# sm_100 / sm_103 output pass (tcgen05, olala/csrc/mamba3_scan_prefill_tc.cu); OLALA_SCAN_TC=0: TileLang
+_SCAN_TC = _os.environ.get("OLALA_SCAN_TC", "1") == "1"
+_SCAN_TC_EXT = None
+
+
+def _scan_tc_ok(dev) -> bool:
+    return _SCAN_TC and torch.cuda.get_device_capability(dev) in ((10, 0), (10, 3))
+
+
+def _scan_tc_ext():
+    global _SCAN_TC_EXT
+    if _SCAN_TC_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}{minor}a"
+        _SCAN_TC_EXT = load_extension("olala_mamba3_scan_prefill_tc", "mamba3_scan_prefill_tc.cu",
+                                      ["-O3", "-std=c++17", "--use_fast_math",
+                                       f"-gencode=arch=compute_{arch},code=sm_{arch}"])
+    return _SCAN_TC_EXT
 
 
 def _scan_ext():
@@ -368,9 +390,11 @@ def mamba3_mimo_hybrid_pools(
     v_cu, m_lrow, m_end = take(NC + 1), take(NS), take(NS)
     f32 = dict(device=dev, dtype=torch.float32)
     dacs, ts, gam = torch.empty(H, T, **f32), torch.empty(H, T, **f32), torch.empty(H, T, **f32)
+    scan_tc = _scan_tc_ok(dev)
     cs_cuda = _CS_CUDA and _scan_cuda_ok(dev)
+    cs_tc = _CS_CUDA and scan_tc
     cl_t = sl_t = None  # fp16 cos / sin tables, only for the Triton chunk-state kernels
-    if not cs_cuda:
+    if not (cs_cuda or cs_tc):
         cl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
         sl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
     thl = torch.empty(T, H, NQ, **f32)
@@ -383,9 +407,12 @@ def mamba3_mimo_hybrid_pools(
     DA_CS = torch.empty(1, H, T, **f32)
     DA_CS_REV = torch.empty(1, H, T, **f32)
     _ssd_prep[(NC, H)](angles, DT, ADT, Trap, m_start, m_len, m_send, dacs, ts, gam, thl, dtot, asum, cl_t, sl_t,
-                       T, H, NQ=NQ, LS=chunk_tokens, dcs16_ptr=DA_CS, dcsr16_ptr=DA_CS_REV, G16=tl_chunk,
-                       WRITE_CS=not cs_cuda, num_warps=tune.get("prep_nw", 8))
-    if cs_cuda:
+                       T, H, NQ=NQ, LS=chunk_tokens, dcs16_ptr=DA_CS, dcsr16_ptr=DA_CS_REV,
+                       G16=32 if scan_tc else tl_chunk,
+                       WRITE_CS=not (cs_cuda or cs_tc), num_warps=tune.get("prep_nw", 8))
+    if cs_tc:
+        _scan_tc_ext().chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
+    elif cs_cuda:
         _scan_ext().chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
     else:
         _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
@@ -398,7 +425,11 @@ def mamba3_mimo_hybrid_pools(
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
         HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=tune.get("pass_nw", 2),
     )
-    if _scan_cuda_ok(dev):
+    if scan_tc:
+        k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
+        _scan_tc_ext().scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,
+                            m_start, m_len, m_last, SinT, out, k_fin, NC)
+    elif _scan_cuda_ok(dev):
         k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
         _scan_ext().scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,
                          m_start, m_len, m_last, SinT, out, k_fin, NC)
