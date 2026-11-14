@@ -75,8 +75,10 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 # exactly one CTA owns each (batch, head) row — the precondition for letting
 # the kernel store the new B/x key/value states itself (``update_kv_state``).
 _STEP_TILE_D = 64
-# OLALA_RAW_STEP=0 keeps the separate decode preamble launch.
-_RAW_STEP = os.environ.get("OLALA_RAW_STEP", "1") != "0"
+# OLALA_RAW_STEP=1 folds the decode preamble into the CUDA step. Off by default:
+# with the fp32 SSM state the in-kernel preamble lengthens each CTA's serial
+# critical path more than the saved launch (-5..8% decode throughput on B300).
+_RAW_STEP = os.environ.get("OLALA_RAW_STEP", "0") == "1"
 _STEP_NUM_WARPS = 4
 
 # Fusing bias+rotary into the step kernel avoids materializing the per-head
