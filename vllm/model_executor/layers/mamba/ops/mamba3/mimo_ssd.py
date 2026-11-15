@@ -365,7 +365,7 @@ def mamba3_mimo_hybrid_pools(
     Q, K, V, Z, angles, DT, ADT, Trap, q_bias, k_bias, psi, phi, zeta, D,
     cu_seqlens_cpu: list[int],
     pools, slots: torch.Tensor, has_init: torch.Tensor | None, out: torch.Tensor,
-    chunk_tokens: int = 128,
+    chunk_tokens: int | None = None,
     tl_chunk: int = 16,
     tune: dict | None = None,
 ):
@@ -378,6 +378,9 @@ def mamba3_mimo_hybrid_pools(
     H, P = V.shape[1], V.shape[2]
     NQ = N // 4
     dev = Q.device
+    scan_tc = _scan_tc_ok(dev)
+    # Longer chunks halve the serial state pass and the per-item overheads of the tcgen05 kernels (same accuracy).
+    chunk_tokens = chunk_tokens or (256 if scan_tc else 128)
     NC, NS, meta = _layout_meta(tuple(cu_seqlens_cpu), chunk_tokens, dev)
     o = 0
     def take(k):
@@ -390,7 +393,6 @@ def mamba3_mimo_hybrid_pools(
     v_cu, m_lrow, m_end = take(NC + 1), take(NS), take(NS)
     f32 = dict(device=dev, dtype=torch.float32)
     dacs, ts, gam = torch.empty(H, T, **f32), torch.empty(H, T, **f32), torch.empty(H, T, **f32)
-    scan_tc = _scan_tc_ok(dev)
     cs_cuda = _CS_CUDA and _scan_cuda_ok(dev)
     cs_tc = _CS_CUDA and scan_tc
     cl_t = sl_t = None  # fp16 cos / sin tables, only for the Triton chunk-state kernels

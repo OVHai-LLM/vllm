@@ -591,7 +591,8 @@ __global__ void __launch_bounds__(THREADS, 1) mamba3_scan_prefill_tc_kernel(
 // Chunk-local states (replaces _ssd_chunk_state on sm_100 / sm_103): per 128-token chunk and head
 //   Sloc[n][p] = sum_j khat_j^T (PsiV_j * ts_j * exp(dtot - dacs_j))      (fp32, layout (NC, H, N, P))
 // with khat rotated by the chunk-local phase thl (the state pass applies the chunk's phase offset), as the sm90 kernel.
-// Producers (TMA raw K / V / phases into a three-deep ring, in-place bias + rotation, weighted PsiV), one MMA thread
+// Producers (TMA raw K / V / phases into a three-deep ring, token weights and the cos / sin table, then in-place bias +
+// rotation and the weighted PsiV), one MMA thread
 // (UMMA M=128 N=64 per 32-token sub-block into one of two TMEM accumulators), four epilogue warps (TMEM -> global).
 namespace cs {
 constexpr int NPROD = 11, MMA_WARP = 4, PROD0 = 5, THREADS = (PROD0 + NPROD) * 32, PT = NPROD * 32, NST = 3;
@@ -707,6 +708,7 @@ __global__ void __launch_bounds__(THREADS, 1) chunk_state_tc_kernel(
       mbar_wait(&S.cfull[k & 1], (k >> 1) & 1);
       bar_sync(BAR_PROD, PT);  // item k's constants (and the raw scalars issued so far) visible; cst[(k + 1) & 1] free
       fetch_consts(k + 1);
+      for (int j = pt; j < R * P; j += PT) cb.psi[j] = rbf(cb.psi[j]);  // read after the next bar
       const float dl = cb.dl[0];
       U8 bk[4];
       {
@@ -724,6 +726,7 @@ __global__ void __launch_bounds__(THREADS, 1) chunk_state_tc_kernel(
         Stage& sg = S.stage[s];
         mbar_wait(&S.tfull[s], (gi / NST) & 1);
         bar_sync(BAR_PROD, PT);
+        if (pt < C) sg.ts[pt] = pt < nv ? sg.ts[pt] * __expf(dl - sg.dacs[pt]) : 0.f;  // token weight
         for (int idx = pt; idx < C * NQ; idx += PT) {
           float th = sg.th[idx];
           th = th - 6.283185307179586f * floorf(th * 0.15915494309189535f);
@@ -731,21 +734,6 @@ __global__ void __launch_bounds__(THREADS, 1) chunk_state_tc_kernel(
           __sincosf(th, &sv, &cv);
           sg.th[idx] = cv;
           sg.sn[idx] = sv;
-        }
-        for (int u = pt; u < ROWS * 8; u += PT) {  // PsiV * w, (row, 16-byte piece)
-          const int row = u >> 3, ci = u & 7, tok = row >> 2, r4 = row & 3;
-          const float wt = tok < nv ? sg.ts[tok] * __expf(dl - sg.dacs[tok]) : 0.f;
-          U8 va;
-          va.u = *reinterpret_cast<const uint4*>(&sg.v[swz(tok, 8 * ci)]);
-          const float4 pa = *reinterpret_cast<const float4*>(&cb.psi[r4 * P + 8 * ci]);
-          const float4 pb = *reinterpret_cast<const float4*>(&cb.psi[r4 * P + 8 * ci + 4]);
-          const float ps[8] = {pa.x, pa.y, pa.z, pa.w, pb.x, pb.y, pb.z, pb.w};
-#pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            const float2 x = __bfloat1622float2(va.h2[j]);
-            va.h2[j] = __floats2bfloat162_rn(x.x * rbf(ps[2 * j]) * wt, x.y * rbf(ps[2 * j + 1]) * wt);
-          }
-          *reinterpret_cast<uint4*>(&sg.pv[swz(row, 8 * ci)]) = va.u;
         }
         bar_sync(BAR_PROD, PT);
 #pragma unroll 1
@@ -777,6 +765,19 @@ __global__ void __launch_bounds__(THREADS, 1) chunk_state_tc_kernel(
           *reinterpret_cast<uint4*>(&sg.k[TILE + oA]) = k4[1].u;
           *reinterpret_cast<uint4*>(&sg.k[oB]) = k4[2].u;
           *reinterpret_cast<uint4*>(&sg.k[TILE + oB]) = k4[3].u;
+        }
+        for (int u = pt; u < ROWS * 8; u += PT) {  // PsiV * w, (row, 16-byte piece)
+          const int row = u >> 3, ci = u & 7, tok = row >> 2, r4 = row & 3;
+          const float2 w2 = make_float2(sg.ts[tok], sg.ts[tok]);
+          U8 va;
+          va.u = *reinterpret_cast<const uint4*>(&sg.v[swz(tok, 8 * ci)]);
+          const float4 pa = *reinterpret_cast<const float4*>(&cb.psi[r4 * P + 8 * ci]);
+          const float4 pb = *reinterpret_cast<const float4*>(&cb.psi[r4 * P + 8 * ci + 4]);
+          const float2 ps2[4] = {make_float2(pa.x, pa.y), make_float2(pa.z, pa.w), make_float2(pb.x, pb.y), make_float2(pb.z, pb.w)};
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            va.h2[j] = __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(__bfloat1622float2(va.h2[j]), ps2[j]), w2));
+          *reinterpret_cast<uint4*>(&sg.pv[swz(row, 8 * ci)]) = va.u;
         }
         fence_async();
         __syncwarp();
