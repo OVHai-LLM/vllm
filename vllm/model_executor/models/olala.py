@@ -343,8 +343,18 @@ class OlalaLatentMoE(nn.Module):
             raise ValueError(f"OLALA_ROUTER_GEMM={self._router_mode!r}")
         self._router_w: torch.Tensor | None = None
         self._small_w: tuple[torch.Tensor, torch.Tensor] | None = None
+        # FlashInfer backends (TRTLLM, CUTLASS) repack the expert weights for
+        # their own kernels after loading; the small/medium kernels read the
+        # plain [E, N, K] layout, so they are only valid on the other backends.
+        moe_backend = getattr(
+            getattr(self.experts.routed_experts, "quant_method", None),
+            "unquantized_backend",
+            None,
+        )
         self._small_path = (
-            self._fused_proj and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
+            self._fused_proj
+            and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
+            and not (moe_backend is not None and moe_backend.name.startswith("FLASHINFER"))
         )
 
         # Medium batches (decode): fused routing/sort, relu^2 in the up GEMM,
@@ -433,6 +443,10 @@ class OlalaLatentMoE(nn.Module):
             # First call is the profiling run, before CUDA graph capture: a
             # cache built during capture would live in a graph's private pool.
             self._entry_weight()
+        if self._fused_proj and self._small_w is None:
+            # Same for the generic fused-projection path (small paths off):
+            # built lazily inside a capture, the cache would be overwritten.
+            self._small_path_weights()
         re = self.experts.routed_experts if self._small_path else None
         # int8 experts on sm8x / sm90: the CUDA small path covers up to 32 tokens
         small_max = (
