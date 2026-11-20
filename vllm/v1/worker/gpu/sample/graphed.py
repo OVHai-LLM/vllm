@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-MAX_GRAPHED_REQS = 8
+MAX_GRAPHED_REQS = 32
 _MAX_GRAPHS = 128
 
 
