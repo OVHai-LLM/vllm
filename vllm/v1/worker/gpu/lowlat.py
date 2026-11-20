@@ -15,6 +15,7 @@ from dataclasses import dataclass
 class _LowLat:
     staged_writes: bool = True
     sampler_graph: bool = True
+    fused_topk: bool = True
 
 
 _on = os.environ.get("VLLM_LOWLAT", "1") != "0"

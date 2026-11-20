@@ -23,6 +23,8 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu.lowlat import LOWLAT
+from vllm.v1.worker.gpu.sample.fused_topk import MAX_K, fused_topk_topp_sample
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler, apply_top_k_top_p
@@ -78,14 +80,16 @@ class GraphedSampler:
         do_top_k = bool(np.any(top_k_np != st.vocab_size))
         do_top_p = bool(np.any(top_p_np != 1.0))
         topp_only = bool(do_top_p and np.any((top_k_np >= st.vocab_size) & (top_p_np < 1.0)))
+        # Every row with an active top-k <= MAX_K: one fused two-kernel pass (fused_topk.py)
+        fused = bool(LOWLAT.fused_topk and do_top_k and np.all(top_k_np <= MAX_K))
         hs = hidden_states[:n]
         pos = input_batch.positions[:n]
         tabs = (st.temperature.gpu, st.seeds.gpu, st.top_k.gpu, st.top_p.gpu)
         key = (n, hs.data_ptr(), pos.data_ptr(), *(t.data_ptr() for t in tabs),
-               needs_proc, do_temp, do_top_k, do_top_p, topp_only)
+               needs_proc, do_temp, do_top_k, do_top_p, topp_only, fused)
         entry = self.graphs.get(key)
         if entry is None:
-            entry = self._capture(key, hs, pos, tabs, n, needs_proc, do_temp, do_top_k, do_top_p, topp_only)
+            entry = self._capture(key, hs, pos, tabs, n, needs_proc, do_temp, do_top_k, do_top_p, topp_only, fused)
         graph, idx_buf, out = entry
         idx_buf.copy_(input_batch.expanded_idx_mapping[:n], non_blocking=True)
         graph.replay()
@@ -103,9 +107,13 @@ class GraphedSampler:
             sampling_mask_tensors=None,
         )
 
-    def _body(self, hs, pos, idx, tabs, needs_proc, do_temp, do_top_k, do_top_p, topp_only):
+    def _body(self, hs, pos, idx, tabs, needs_proc, do_temp, do_top_k, do_top_p, topp_only, fused):
         temperature, seeds, top_k_tab, top_p_tab = tabs
         logits = self.model.compute_logits(hs)
+        if fused:
+            return fused_topk_topp_sample(
+                logits, idx, temperature, top_k_tab, top_p_tab, seeds, pos, MAX_K
+            )
         if needs_proc:
             logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
             if do_temp:
