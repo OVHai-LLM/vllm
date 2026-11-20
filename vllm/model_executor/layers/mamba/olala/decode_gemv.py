@@ -143,6 +143,36 @@ def _skinny_cfg(M: int, N: int, K: int) -> tuple[int, int, int, int]:
     return 32, 128, 4, (8 if M > 32 else 4)
 
 
+def mm_f32_small(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``torch.mm(x, weight.T, out_dtype=float32)`` for the MoE entry GEMM at decode sizes.
+
+    cuBLAS's fp32-output kernels at 1-8 rows sit at 6-10 us on B300 for the 2176x1536 entry
+    weight; the full-K GEMV is 3.1 us at one row and the skinny kernel ~5 us at 2-8 rows (same
+    values: fp32 accumulation, bit-identical to cuBLAS on random data). ``OLALA_ENTRY_GEMV=0``
+    keeps cuBLAS."""
+    M, K = x.shape
+    N = weight.shape[0]
+    if (
+        _ENTRY_GEMV and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+        and x.stride(1) == 1 and weight.stride(1) == 1 and M <= 8 and K <= 4096 and is_blackwell()
+    ):
+        y = torch.empty(M, N, dtype=torch.float32, device=x.device)
+        if M == 1:
+            _gemv_m1_full_kernel[(N,)](
+                x, weight, y, N, K, weight.stride(0), BN=1, BK=triton.next_power_of_2(K), num_warps=4,
+            )
+        elif K % 256 == 0:
+            _skinny_kernel[(triton.cdiv(N, 16),)](
+                x, weight, y, M, N, K, x.stride(0), weight.stride(0), y.stride(0),
+                BM=16, BN=16, BK=256, num_stages=4, num_warps=4,
+            )
+        else:
+            return torch.mm(x, weight.T, out_dtype=torch.float32)
+        return y
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+_ENTRY_GEMV = os.environ.get("OLALA_ENTRY_GEMV", "1") == "1"
 SKINNY_MAX_M = 64
 _SKINNY = os.environ.get("OLALA_SKINNY", "1") == "1"
 

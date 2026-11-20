@@ -93,6 +93,7 @@ def _latent_moe_up_kernel(
     K: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     PDL: tl.constexpr = False,
+    KP: tl.constexpr = 8,   # next_power_of_2(K)
 ):
     """Expert up-projection + relu^2 for one (token, slot k, N-block).
 
@@ -113,28 +114,32 @@ def _latent_moe_up_kernel(
     # Padded batch rows carry garbage/NaN logits; NaN never compares equal to
     # the max, which would select index E and read past the expert weights.
     sb = tl.where(sb != sb, float("-inf"), sb)
-    tot = 0.0
-    e = 0
-    wsel = 0.0
-    for kk in range(K):
-        mx = tl.max(sb, axis=0)
-        idx = tl.minimum(tl.min(tl.where(sb == mx, offs_e, E), axis=0), E - 1)
-        w = tl.sum(tl.where(offs_e == idx, sc, 0.0), axis=0)
-        tot += w
-        if kk == k_slot:
-            e = idx
-            wsel = w
-        sb = tl.where(offs_e == idx, float("-inf"), sb)
+    # One tl.topk over packed (order-preserving score bits, E-1-index) keys: same
+    # winners and order as K rounds of max / lowest-index argmax (ties -> lower
+    # index), without K dependent block reductions (B300 decode: 7.3 -> 4.0 us).
+    b = sb.to(tl.int32, bitcast=True)
+    ob = tl.where(b < 0, ~b, b | (-2147483648))
+    key = (ob.to(tl.uint32).to(tl.uint64) << 32) | (E - 1 - offs_e).to(tl.uint64)
+    top = tl.topk(key, KP)
+    offs_r = tl.arange(0, KP)
+    kth = tl.sum(tl.where(offs_r == K - 1, top, 0), axis=0)
+    myk = tl.sum(tl.where(offs_r == k_slot, top, 0), axis=0)
+    tot = tl.sum(tl.where(key >= kth, sc, 0.0), axis=0)
+    mine = key == myk
+    e = tl.minimum(tl.sum(tl.where(mine, offs_e, 0), axis=0), E - 1)
+    wsel = tl.sum(tl.where(mine, sc, 0.0), axis=0)
     if nb == 0:
         tl.store(ids_ptr + pid, e.to(tl.int32))
         tl.store(tw_ptr + pid, wsel / tot)
     e64 = e.to(tl.int64)
     offs_n = nb * BN + tl.arange(0, BN)
+    # BD >= D: the whole row in one load (all of it in flight at once)
     acc = tl.zeros([BN], dtype=tl.float32)
     for d0 in range(0, D, BD):
         offs_d = d0 + tl.arange(0, BD)
-        x = tl.load(x_ptr + m * stride_xm + offs_d).to(tl.bfloat16).to(tl.float32)
-        w = tl.load(w1_ptr + e64 * N * D + offs_n[:, None] * D + offs_d[None, :])
+        dm = offs_d < D
+        x = tl.load(x_ptr + m * stride_xm + offs_d, mask=dm, other=0.0).to(tl.bfloat16).to(tl.float32)
+        w = tl.load(w1_ptr + e64 * N * D + offs_n[:, None] * D + offs_d[None, :], mask=dm[None, :], other=0.0)
         acc += tl.sum(w.to(tl.float32) * x[None, :], axis=1)
     if HAS_SCALE:
         acc *= tl.load(w1s_ptr + e64 * N + offs_n)
@@ -288,7 +293,8 @@ def olala_moe_small(
     _latent_moe_up_kernel[(M * top_k, N1 // 16)](
         x_in, router_logits, e_score_bias, topk_ids, topk_w, w13,
         w13_scale if q13 else topk_w, h, x_in.stride(0), router_logits.stride(0),
-        E=E, D=D1, N=N1, BN=16, BD=64, K=top_k, HAS_SCALE=q13, num_warps=4,
+        E=E, D=D1, N=N1, BN=16, BD=triton.next_power_of_2(D1), K=top_k, HAS_SCALE=q13, num_warps=4,
+        KP=triton.next_power_of_2(top_k),
         **pdl_kwargs(),
     )
     part = torch.empty(M * top_k, D2, dtype=torch.float32, device=dev)

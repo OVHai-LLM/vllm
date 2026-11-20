@@ -42,7 +42,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv, olala_linear
+from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv, mm_f32_small, olala_linear
 from vllm.model_executor.layers.mamba.olala.geo_linear import (
     GEO_FUSE,
     GEO_LINEAR_MAX_TOKENS,
@@ -449,9 +449,7 @@ class OlalaLatentMoE(nn.Module):
                 # output: the logits match GateLinear's bf16 x bf16 -> fp32,
                 # and the kernels round x_in to bf16 on load, i.e. exactly a
                 # bf16 GEMM output.
-                y = torch.mm(
-                    hidden_states, self._entry_weight().T, out_dtype=torch.float32
-                )
+                y = mm_f32_small(hidden_states, self._entry_weight())
                 n_in = y.shape[1] - self.num_experts
                 x_in, router_logits = y[:, :n_in], y[:, n_in:]
             else:
