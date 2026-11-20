@@ -39,7 +39,7 @@ constexpr int NSOFT = 6, THREADS = 8 * 32;
 constexpr int MMA_WARP = 3, TMA_WARP = 7;
 constexpr int T_LO = 7;   // tokens 0..6 -> warps 0-2, 7..12 -> warps 4-6
 constexpr int HALF_BYTES = 16 * R * 128;                 // 64 rows x 128 B (a 64-element k-half / n-half)
-constexpr unsigned TILE_TX = 2u * (NTOK * 2 * 512 + T * NCOEF * 2);
+constexpr unsigned HALF_TX = NTOK * 2 * 512 + T * NCOEF * 2;   // one plane (K or V) of a tile: B rows + halo + coefficients
 constexpr int TMEM_COLS = 256;                           // qB[2] (2 x 64 cols) + O (128 cols)
 constexpr int TM_QB = 0, TM_O = 128;
 #ifndef TPA_RESCALE_THRESHOLD
@@ -55,7 +55,9 @@ struct __align__(1024) Smem {
   char bv[NBUF][2][HALF_BYTES];   // [buf][n half] MN-major SW128: row k = tok*4 + r; rows 56..63 zero
   __nv_bfloat16 ck[NBUF][T * NCOEF + 96];   // tokens t = 0..12: [Ck 48 | Dk 48]
   __nv_bfloat16 cv[NBUF][T * NCOEF + 96];
-  unsigned long long full[NBUF], empty[NBUF], s_full[2], s_free[2], w_full[2], o_done[2];
+  // Split stages: the K half (Bk, Ck) of a stage is reloaded as soon as the softmax has scored its tile, without
+  // waiting for that tile's W Bv product, which only holds the V half (Bv, Cv).
+  unsigned long long kfull[NBUF], vfull[NBUF], kempty[NBUF], vempty[NBUF], s_full[2], s_free[2], w_full[2], o_done[2];
   uint32_t tmem_base;
   int blk_first, nblk;
   int blocks[NBLK_CACHE];   // block ids of this split (the producer would otherwise wait on a global load per tile)
@@ -174,25 +176,26 @@ struct BlockLookup {
 
 // sm_90a kernel's producer: one wide TMA set per tile (13 tokens of one block + the halo), or one lane per token at the
 // first / last tile with the tokens outside [0, seqlen) zero-filled.
+template <int PLANE>   // 0: K half (Bk, Ck), 1: V half (Bv, Cv)
 __device__ __forceinline__ void producer_issue(Smem& S, int buf, const TmaMaps& M, const __nv_bfloat16* __restrict__ kpl, const __nv_bfloat16* __restrict__ vpl,
                                                long long bstride, const BlockLookup& locate, int BS, int seqlen, int t0, int lane) {
+  unsigned long long* bar = PLANE ? &S.vfull[buf] : &S.kfull[buf];
+  char (*bm)[HALF_BYTES] = PLANE ? S.bv[buf] : S.bk[buf];
+  __nv_bfloat16* cf = PLANE ? S.cv[buf] : S.ck[buf];
+  const CUtensorMap* m13 = PLANE ? &M.v13 : &M.k13;
+  const CUtensorMap* m1 = PLANE ? &M.v1 : &M.k1;
   const bool wide = (t0 >= 1) && (t0 + T <= seqlen);
   if (wide) {
-    if (lane == 0) mbar_arrive_expect_tx(&S.full[buf], TILE_TX);
+    if (lane == 0) mbar_arrive_expect_tx(bar, HALF_TX);
     __syncwarp();
-    if (lane < 10) {
+    if (lane < 5) {
       int s0, b0, sp, bp; locate(t0, BS, s0, b0); locate(t0 - 1, BS, sp, bp);
       switch (lane) {
-        case 0: tma4d(S.bk[buf][0] + 512, &M.k13, 0, 0, s0, b0, &S.full[buf]); break;
-        case 1: tma4d(S.bk[buf][1] + 512, &M.k13, 64, 0, s0, b0, &S.full[buf]); break;
-        case 2: tma4d(S.bv[buf][0] + 512, &M.v13, 0, 0, s0, b0, &S.full[buf]); break;
-        case 3: tma4d(S.bv[buf][1] + 512, &M.v13, 64, 0, s0, b0, &S.full[buf]); break;
-        case 4: tma3d(S.ck[buf], &M.ck13, 0, s0, b0, &S.full[buf]); break;
-        case 5: tma3d(S.cv[buf], &M.cv13, 0, s0, b0, &S.full[buf]); break;
-        case 6: tma4d(S.bk[buf][0], &M.k1, 0, 0, sp, bp, &S.full[buf]); break;
-        case 7: tma4d(S.bk[buf][1], &M.k1, 64, 0, sp, bp, &S.full[buf]); break;
-        case 8: tma4d(S.bv[buf][0], &M.v1, 0, 0, sp, bp, &S.full[buf]); break;
-        case 9: tma4d(S.bv[buf][1], &M.v1, 64, 0, sp, bp, &S.full[buf]); break;
+        case 0: tma4d(bm[0] + 512, m13, 0, 0, s0, b0, bar); break;
+        case 1: tma4d(bm[1] + 512, m13, 64, 0, s0, b0, bar); break;
+        case 2: tma3d(cf, PLANE ? &M.cv13 : &M.ck13, 0, s0, b0, bar); break;
+        case 3: tma4d(bm[0], m1, 0, 0, sp, bp, bar); break;
+        case 4: tma4d(bm[1], m1, 64, 0, sp, bp, bar); break;
       }
     }
     return;
@@ -202,29 +205,24 @@ __device__ __forceinline__ void producer_issue(Smem& S, int buf, const TmaMaps& 
   const unsigned nvalid = __popc(__ballot_sync(0xffffffffu, valid));
   const unsigned nvalid_c = __popc(__ballot_sync(0xffffffffu, valid && tok >= 1));
   if (mine && !valid) {
-    for (int h = 0; h < 2; ++h) for (int c = 0; c < 32; ++c) {
-      *reinterpret_cast<uint4*>(S.bk[buf][h] + tok * 512 + c * 16) = make_uint4(0, 0, 0, 0);
-      *reinterpret_cast<uint4*>(S.bv[buf][h] + tok * 512 + c * 16) = make_uint4(0, 0, 0, 0);
-    }
+    for (int h = 0; h < 2; ++h) for (int c = 0; c < 32; ++c)
+      *reinterpret_cast<uint4*>(bm[h] + tok * 512 + c * 16) = make_uint4(0, 0, 0, 0);
     if (tok >= 1) {
-      __nv_bfloat16* zk = S.ck[buf] + (tok - 1) * NCOEF; __nv_bfloat16* zv = S.cv[buf] + (tok - 1) * NCOEF;
-      for (int c = 0; c < NCOEF / 8; ++c) { *reinterpret_cast<uint4*>(zk + c * 8) = make_uint4(0, 0, 0, 0); *reinterpret_cast<uint4*>(zv + c * 8) = make_uint4(0, 0, 0, 0); }
+      __nv_bfloat16* z = cf + (tok - 1) * NCOEF;
+      for (int c = 0; c < NCOEF / 8; ++c) *reinterpret_cast<uint4*>(z + c * 8) = make_uint4(0, 0, 0, 0);
     }
     fence_proxy_async();   // the tensor cores read B through the async proxy
   }
   __syncwarp();
-  if (lane == 0) mbar_arrive_expect_tx(&S.full[buf], nvalid * 2u * 2 * 512 + nvalid_c * 2u * NCOEF * 2);
+  if (lane == 0) mbar_arrive_expect_tx(bar, nvalid * 2 * 512 + nvalid_c * NCOEF * 2);
   __syncwarp();
   if (mine && valid) {
     int s, bl; locate(t, BS, s, bl);
-    tma4d(S.bk[buf][0] + tok * 512, &M.k1, 0, 0, s, bl, &S.full[buf]);
-    tma4d(S.bk[buf][1] + tok * 512, &M.k1, 64, 0, s, bl, &S.full[buf]);
-    tma4d(S.bv[buf][0] + tok * 512, &M.v1, 0, 0, s, bl, &S.full[buf]);
-    tma4d(S.bv[buf][1] + tok * 512, &M.v1, 64, 0, s, bl, &S.full[buf]);
+    tma4d(bm[0] + tok * 512, m1, 0, 0, s, bl, bar);
+    tma4d(bm[1] + tok * 512, m1, 64, 0, s, bl, bar);
     if (tok >= 1) {
       const size_t grow = (size_t)bl * bstride + (size_t)s * ROWP;
-      tma_bulk_g2s(S.ck[buf] + (tok - 1) * NCOEF, kpl + grow + OFF_C, NCOEF * 2, &S.full[buf]);
-      tma_bulk_g2s(S.cv[buf] + (tok - 1) * NCOEF, vpl + grow + OFF_C, NCOEF * 2, &S.full[buf]);
+      tma_bulk_g2s(cf + (tok - 1) * NCOEF, (PLANE ? vpl : kpl) + grow + OFF_C, NCOEF * 2, bar);
     }
   }
 }
@@ -254,7 +252,7 @@ __device__ __forceinline__ void softmax_warp(Smem& S, uint32_t tmem, int quad, i
   float m = -CUDART_INF_F, l = 0.f;
   for (int it = 0; it < ntiles; ++it) {
     const int buf = it % NBUF, t0 = start + it * T;
-    mbar_wait(&S.full[buf], (it / NBUF) & 1);
+    mbar_wait(&S.kfull[buf], (it / NBUF) & 1);
     mbar_wait(&S.s_full[it % 2], (it / 2) & 1);
     tc_fence_after();
     float qv[32];
@@ -280,6 +278,8 @@ __device__ __forceinline__ void softmax_warp(Smem& S, uint32_t tmem, int quad, i
       pl[j] = sc;
       mt = fmaxf(mt, sc);
     }
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&S.kempty[buf]);   // Ck read, qB done with Bk: the K half can be refilled
     if (live) S.xmax[HALF][h] = mt;
     pair_bar(quad);
     mt = fmaxf(mt, S.xmax[1 - HALF][h]);
@@ -314,6 +314,7 @@ __device__ __forceinline__ void softmax_warp(Smem& S, uint32_t tmem, int quad, i
       tmem_wait_st();
     }
     // W row: W[(tokidx, r)] = p[tokidx-1] Cv[tokidx-1, g, r] + p[tokidx] Dv[tokidx, g, r]; columns 56..63 zero
+    mbar_wait(&S.vfull[buf], (it / NBUF) & 1);
     const __nv_bfloat16* cv = S.cv[buf];
     char* wrow = S.w[it % 2] + h * 128;
 #pragma unroll
@@ -391,7 +392,7 @@ tpa_factor_decode_tc_kernel(const __grid_constant__ TmaMaps maps, const __nv_bfl
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n" ::);
   }
   if (tid == 0) {
-    for (int i = 0; i < NBUF; ++i) { mbar_init(&S.full[i], 1); mbar_init(&S.empty[i], 1); }
+    for (int i = 0; i < NBUF; ++i) { mbar_init(&S.kfull[i], 1); mbar_init(&S.vfull[i], 1); mbar_init(&S.kempty[i], NSOFT); mbar_init(&S.vempty[i], 1); }
     for (int i = 0; i < 2; ++i) { mbar_init(&S.s_full[i], 1); mbar_init(&S.s_free[i], NSOFT); mbar_init(&S.w_full[i], NSOFT); mbar_init(&S.o_done[i], 1); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
   }
@@ -423,10 +424,13 @@ tpa_factor_decode_tc_kernel(const __grid_constant__ TmaMaps maps, const __nv_bfl
 
   if (warp == TMA_WARP) {
     const BlockLookup locate{btb, S.blocks, S.blk_first, S.nblk};
-    for (int it = 0; it < ntiles; ++it) {
-      const int buf = it % NBUF;
-      if (it >= NBUF) mbar_wait(&S.empty[buf], ((it / NBUF) + 1) & 1);
-      producer_issue(S, buf, maps, kpl, vpl, bstride, locate, BS, seqlen, start + it * T, lane);
+    int nk = 0, nv = 0;
+    while (nv < ntiles) {
+      // warp-uniform decisions (the edge tiles issue one token per lane)
+      const bool k_ok = nk < ntiles && (nk < NBUF || __shfl_sync(0xffffffffu, (int)mbar_test(&S.kempty[nk % NBUF], ((nk / NBUF) + 1) & 1), 0));
+      if (k_ok) { producer_issue<0>(S, nk % NBUF, maps, kpl, vpl, bstride, locate, BS, seqlen, start + nk * T, lane); ++nk; }
+      const bool v_ok = nv < nk && (nv < NBUF || __shfl_sync(0xffffffffu, (int)mbar_test(&S.vempty[nv % NBUF], ((nv / NBUF) + 1) & 1), 0));
+      if (v_ok) { producer_issue<1>(S, nv % NBUF, maps, kpl, vpl, bstride, locate, BS, seqlen, start + nv * T, lane); ++nv; }
     }
   } else if (warp == MMA_WARP) {
     if (lane == 0) {
@@ -435,7 +439,7 @@ tpa_factor_decode_tc_kernel(const __grid_constant__ TmaMaps maps, const __nv_bfl
       // so a stage is handed back to the TMA warp right after its W Bv product instead of after the next tile lands
       int n1 = 0, n2 = 0;
       while (n2 < ntiles) {
-        if (n1 < ntiles && n1 - n2 < 2 && mbar_test(&S.full[n1 % NBUF], (n1 / NBUF) & 1) &&
+        if (n1 < ntiles && n1 - n2 < 2 && mbar_test(&S.kfull[n1 % NBUF], (n1 / NBUF) & 1) &&
             (n1 < 2 || mbar_test(&S.s_free[n1 % 2], ((n1 - 2) / 2) & 1))) {
           const int buf = n1 % NBUF;
           tc_fence_after();
@@ -448,7 +452,7 @@ tpa_factor_decode_tc_kernel(const __grid_constant__ TmaMaps maps, const __nv_bfl
           umma_commit(&S.s_full[n1 % 2]);
           ++n1;
         }
-        if (n2 < n1 && mbar_test(&S.w_full[n2 % 2], (n2 / 2) & 1)) {
+        if (n2 < n1 && mbar_test(&S.w_full[n2 % 2], (n2 / 2) & 1) && mbar_test(&S.vfull[n2 % NBUF], (n2 / NBUF) & 1)) {
           const int bj = n2 % NBUF;
           tc_fence_after();
 #pragma unroll
@@ -459,7 +463,7 @@ tpa_factor_decode_tc_kernel(const __grid_constant__ TmaMaps maps, const __nv_bfl
               umma(tmem + TM_O + h * 64, ad, umma_desc(smem_u32(S.bv[bj][h]) + k * 2048, 8192, 1024), ID2, (n2 > 0 || k > 0) ? 1u : 0u);
           }
           umma_commit(&S.o_done[n2 % 2]);
-          umma_commit(&S.empty[bj]);
+          umma_commit(&S.vempty[bj]);
           ++n2;
         }
       }
