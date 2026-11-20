@@ -83,6 +83,7 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.plain_sampling = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,16 +96,24 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
-            req_idx, sampling_params
-        )
+        extra = self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            extra |= processor.add_request(req_idx, sampling_params)
+        self.needs_logits_processing[req_idx] = needs_processing or extra
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
+        # Plain random sampling (temperature / top-k / top-p only): the
+        # graphed sampler (graphed.py) may take it.
+        self.plain_sampling[req_idx] = bool(
+            not extra
+            and sampling_params.temperature > 0.0
+            and sampling_params.min_p == 0.0
+            and sampling_params.logprobs is None
+            and sampling_params.seed is None
+            and self.logprob_token_ids_state.num_token_ids.np[req_idx] == 0
+        )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()

@@ -193,6 +193,8 @@ from vllm.v1.worker.utils import (
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
+from vllm.v1.worker.gpu.lowlat import LOWLAT
+
 logger = init_logger(__name__)
 
 
@@ -1264,7 +1266,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
-        if self.sampler is not None:
+            # Sampler state is only staged by sampler.add_request (above): re-copying
+            # every per-request table to UVA on each decode step costs ~130 us of CPU.
+            if self.sampler is not None and LOWLAT.staged_writes:
+                self.sampler.apply_staged_writes()
+        if self.sampler is not None and not LOWLAT.staged_writes:
             self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -1652,6 +1658,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
+            if LOWLAT.sampler_graph and self.sampler is not None:
+                gs = self.__dict__.get("_graphed_sampler")
+                if gs is None:
+                    from vllm.v1.worker.gpu.sample.graphed import GraphedSampler
+
+                    gs = self._graphed_sampler = GraphedSampler(
+                        self.model, self.sampler, self.device
+                    )
+                if gs.eligible(input_batch, grammar_output):
+                    out = gs(hidden_states, input_batch)
+                    return out, out.num_sampled, out.num_rejected
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
