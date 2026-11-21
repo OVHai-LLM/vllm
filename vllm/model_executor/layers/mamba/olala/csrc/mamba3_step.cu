@@ -442,6 +442,9 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
 // which frees the smem tile at once: the next item's state is prefetched while this item computes, the small token
 // rows are double-buffered, and h_new goes straight from the accumulators to the pool (full 32 B sectors per row
 // segment), with no smem round trip and no store loop. Same math, same order: bit-identical to the kernel above.
+// Per-item critical path (it is what B <= 16 waits on once the tiles land, ~4k cycles at B=1): theta is computed in
+// registers by the two warps whose columns it rotates (no smem round trip, one barrier less), the next item's slot is
+// read before the wait, and the h_new stores ride along the C dot's 24 dependent mma instead of preceding them.
 constexpr int LDP = S + 8;   // padded fp32 tile row (conflict-free float2 fragment reads); 4 CTAs/SM still fit
 struct __align__(128) SmallStage {
   __nv_bfloat16 bst[R * S];   // previous B' (k_pool)
@@ -470,25 +473,33 @@ __device__ __forceinline__ void split3_x2(float x0, float x1, uint32_t& hi, uint
   lo = pack_bf16(r0 - __uint_as_float(mid << 16), r1 - __uint_as_float(mid & 0xffff0000u));
 }
 
-__device__ __forceinline__ void pipe_issue(const Args& a, SmemP& S_, SmallStage& st, int item, int t) {
-  const int h = item % H, b = item / H;
-  const int slot = a.slots[b]; const int srow = (slot >= 0 && slot < a.P) ? slot : 0;
+// An item's loads in two parts. The pool rows (state tile, previous B / x, phase of the slot) are only ever written
+// by this kernel (and by the prefill path, which runs after the decode step): under PDL they are issued before
+// griddepcontrol.wait, overlapping the producer's tail. The token rows (B, C, x, z, angle projection) come from it.
+__device__ __forceinline__ void pipe_issue_pool(const Args& a, SmemP& S_, SmallStage& st, int item, int srow, int t) {
+  const int h = item % H;
   const float* src = reinterpret_cast<const float*>(a.ssm) + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
   for (int i = 0; i < 16; ++i) { const int c = t + i * THREADS, row = c >> 5, ch = c & 31; cp16(S_.state + row * LDP + ch * 4, src + c * 4); }
+  if (t < 64) { const int r = t >> 4, c = t & 15; cp16(st.bst + r * S + c * 8, a.kp + (size_t)srow * a.kp_sst + ((size_t)r * H + h) * S + c * 8); }
+  else if (t < 72) cp16(st.xst + (t - 64) * 8, a.vp + (size_t)srow * a.vp_sst + (size_t)h * D + (t - 64) * 8);
+  else if (t < 80) cp16(st.angst + (t - 72) * 4, a.angle + (size_t)srow * a.ang_sst + (size_t)h * NA + (t - 72) * 4);
+}
+__device__ __forceinline__ void pipe_issue_tok(const Args& a, SmallStage& st, int item, int t) {
+  const int h = item % H, b = item / H;
   if (t < 64) {
-    const int r = t >> 4, c = t & 15;
-    cp16(st.bst + r * S + c * 8, a.kp + (size_t)srow * a.kp_sst + ((size_t)r * H + h) * S + c * 8);
     cp16(st.bm + t * 8, a.Bm + (size_t)b * a.bc_bstride + t * 8);
     cp16(st.cm + t * 8, a.Cm + (size_t)b * a.bc_bstride + t * 8);
   } else {
     const int q = t - 64;
     if (q < 8) cp16(st.x + q * 8, a.x + ((size_t)b * H + h) * D + q * 8);
     else if (q < 16) cp16(st.z + (q - 8) * 8, a.z + ((size_t)b * H + h) * D + (q - 8) * 8);
-    else if (q < 24) cp16(st.xst + (q - 16) * 8, a.vp + (size_t)srow * a.vp_sst + (size_t)h * D + (q - 16) * 8);
-    else if (q < 28) cp16(st.angp + (q - 24) * 8, a.angp + (size_t)b * a.angp_stride + (q - 24) * 8);
-    else if (q < 36) cp16(st.angst + (q - 28) * 4, a.angle + (size_t)srow * a.ang_sst + (size_t)h * NA + (q - 28) * 4);
+    else if (q < 20) cp16(st.angp + (q - 16) * 8, a.angp + (size_t)b * a.angp_stride + (q - 16) * 8);
   }
+}
+__device__ __forceinline__ void pipe_issue(const Args& a, SmemP& S_, SmallStage& st, int item, int srow, int t) {
+  pipe_issue_pool(a, S_, st, item, srow, t);
+  pipe_issue_tok(a, st, item, t);
 }
 
 __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const Args a) {
@@ -502,14 +513,16 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
     cp16(S_.bias_q + r * S + c * 4, a.bias_q + ((size_t)r * H + h) * S + c * 4); }
   if (t < 64) { const int r = t >> 4, c = t & 15; cp16(S_.xproj + r * D + c * 4, a.xproj + ((size_t)r * H + h) * D + c * 4); cp16(S_.outproj + r * D + c * 4, a.outproj + ((size_t)r * H + h) * D + c * 4); }
   else { const int q = t - 64, r = q >> 4, c = q & 15; cp16(S_.zproj + r * D + c * 4, a.zproj + ((size_t)r * H + h) * D + c * 4); }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  if (a.pdl) asm volatile("griddepcontrol.wait;\n" ::: "memory");  // PDL: sm_90+ only (pdl is 0 below)
-#endif
   const int b0 = blockIdx.x / H;
   auto item_of = [&](int k) { return (b0 + k * nb_stride) * H + h; };
   const int nk = (a.B - b0 + nb_stride - 1) / nb_stride;
   if (b0 >= a.B) return;
-  pipe_issue(a, S_, S_.sm[0], item_of(0), t); cp_commit();
+  auto srow_of = [&](int item) { const int sl = a.slots[item / H]; return (sl >= 0 && sl < a.P) ? sl : 0; };
+  pipe_issue_pool(a, S_, S_.sm[0], item_of(0), srow_of(item_of(0)), t);   // slots / pools: not the producer's
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (a.pdl) asm volatile("griddepcontrol.wait;\n" ::: "memory");  // PDL: sm_90+ only (pdl is 0 below)
+#endif
+  pipe_issue_tok(a, S_.sm[0], item_of(0), t); cp_commit();
   const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
   for (int k = 0; k < nk; ++k) {
     const int item = item_of(k), b = item / H;
@@ -517,10 +530,11 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
     const float dt = a.dt[b * H + h], A = a.A[b * H + h], trap = a.trap[b * H + h];
     const float Dh = a.Dp[h];
     const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
+    const int nsrow = k + 1 < nk ? srow_of(item_of(k + 1)) : 0;   // fetched before the wait, off the critical path
     cp_wait<0>();
     __syncthreads();
     SmallStage& st = S_.sm[k & 1];
-    // consume the state tile into the accumulators (h_new = alpha h + ...), then hand the tile to the prefetch
+    // consume the state tile into the accumulators (h_new = alpha h + ...)
     float acc[16][4];
 #pragma unroll
     for (int jt = 0; jt < 16; ++jt) {
@@ -529,24 +543,27 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
       const float2 h1 = *reinterpret_cast<const float2*>(S_.state + (p0 + 8) * LDP + n);
       acc[jt][0] = alpha * h0.x; acc[jt][1] = alpha * h0.y; acc[jt][2] = alpha * h1.x; acc[jt][3] = alpha * h1.y;
     }
-    if (t < NA) { float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; th -= 6.283185307179586f * floorf(th / 6.283185307179586f); S_.sTheta[t] = th; sincosf(th, &S_.sSin[t], &S_.sCos[t]); }
-    __syncthreads();   // tile consumed by every warp; theta ready
-    if (k + 1 < nk) pipe_issue(a, S_, S_.sm[(k + 1) & 1], item_of(k + 1), t);
-    cp_commit();
-    for (int i = t; i < R * (S / 2); i += THREADS) {
-      const int r = i / (S / 2), j = i % (S / 2);
+    // theta: thread t rotates columns j = t % 64 (and j + 64) of rows r = t / 64, t / 64 + 2, so only warps 0 and 2
+    // (j = lane < NA) need cos / sin: both compute them in registers (same code, same bits), no smem round trip
+    float th = 0.f, cth = 1.f, sth = 0.f;
+    if (!(warp & 1)) { th = st.angst[lane] + tanhf(bf2f(st.angp[lane])) * dt * 3.14159265358979323846f; th -= 6.283185307179586f * floorf(th / 6.283185307179586f); sincosf(th, &sth, &cth); }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      const int i = t + u * THREADS, r = i / (S / 2), j = i % (S / 2);
       float blo = bf2f(st.bm[r * S + j]) + S_.bias_k[r * S + j], bhi = bf2f(st.bm[r * S + j + 64]) + S_.bias_k[r * S + j + 64];
       float clo = bf2f(st.cm[r * S + j]) + S_.bias_q[r * S + j], chi = bf2f(st.cm[r * S + j + 64]) + S_.bias_q[r * S + j + 64];
       if (j < NA) {
-        const float c = S_.sCos[j], s_ = S_.sSin[j];
-        const float b0_ = blo * c - bhi * s_, b1 = blo * s_ + bhi * c, c0 = clo * c - chi * s_, c1 = clo * s_ + chi * c;
+        const float c = cth, s_ = sth;
+        // explicit FMAs: the contraction nvcc picked for the 1-stage kernel's `blo * c - bhi * s_` / `blo * s_ +
+        // bhi * c` (bit-identical outputs; left to the compiler it changes with the operands' origin)
+        const float b0_ = fmaf(blo, c, -(bhi * s_)), c0 = fmaf(clo, c, -(chi * s_));
+        const float b1 = fmaf(bhi, c, blo * s_), c1 = fmaf(chi, c, clo * s_);
         blo = b0_; bhi = b1; clo = c0; chi = c1;
       }
       S_.sBk[r][j] = __float2bfloat16(blo); S_.sBk[r][j + 64] = __float2bfloat16(bhi);
       S_.sBk[4 + r][j] = st.bst[r * S + j]; S_.sBk[4 + r][j + 64] = st.bst[r * S + j + 64];
       S_.sCb[r][j] = __float2bfloat16(clo); S_.sCb[r][j + 64] = __float2bfloat16(chi);
     }
-    __syncthreads();
     uint32_t ah[3][4];
     {
       float av[2][2];
@@ -566,6 +583,9 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
 #pragma unroll
       for (int q = 0; q < 3; ++q) { ah[q][2] = 0u; ah[q][3] = 0u; }
     }
+    __syncthreads();   // tile consumed by every warp, sBk / sCb ready: the tile takes the next item
+    if (k + 1 < nk) pipe_issue(a, S_, S_.sm[(k + 1) & 1], item_of(k + 1), nsrow, t);
+    cp_commit();
     const int mi = lane >> 3, li = lane & 7;
 #pragma unroll
     for (int jp = 0; jp < 8; ++jp) {
@@ -575,26 +595,28 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
 #pragma unroll
       for (int q = 2; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
     }
-    if (valid) {   // h_new straight to the pool: per warp instruction 8 rows x 32 contiguous bytes
-      float* dst = reinterpret_cast<float*>(a.ssm) + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
-#pragma unroll
-      for (int jt = 0; jt < 16; ++jt) {
-        const int n = jt * 8 + 2 * qd;
-        *reinterpret_cast<float2*>(dst + p0 * S + n) = make_float2(acc[jt][0], acc[jt][1]);
-        *reinterpret_cast<float2*>(dst + (p0 + 8) * S + n) = make_float2(acc[jt][2], acc[jt][3]);
-      }
-    }
+    // the h_new stores ride along the C dot (24 dependent mma): store issue overlaps the mma latency chain
+    float* dst = reinterpret_cast<float*>(a.ssm) + (size_t)(valid ? slot : 0) * a.ssm_sst + ((size_t)h * D) * S;
     float oc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int c = 0; c < 8; ++c) {
       uint32_t bfr[4];
       ldmatrix_x4(bfr, &S_.sCb[li][c * 16 + (mi & 1) * 8]);
-      const float* v[4] = {&acc[2 * c][0], &acc[2 * c][2], &acc[2 * c + 1][0], &acc[2 * c + 1][2]};
       uint32_t a3[3][4];
-#pragma unroll
-      for (int q = 0; q < 4; ++q) split3_x2(v[q][0], v[q][1], a3[0][q], a3[1][q], a3[2][q]);
+      split3_x2(acc[2 * c][0], acc[2 * c][1], a3[0][0], a3[1][0], a3[2][0]);
+      split3_x2(acc[2 * c][2], acc[2 * c][3], a3[0][1], a3[1][1], a3[2][1]);
+      split3_x2(acc[2 * c + 1][0], acc[2 * c + 1][1], a3[0][2], a3[1][2], a3[2][2]);
+      split3_x2(acc[2 * c + 1][2], acc[2 * c + 1][3], a3[0][3], a3[1][3], a3[2][3]);
 #pragma unroll
       for (int q = 2; q >= 0; --q) mma16816(oc, a3[q], bfr);
+      if (valid) {
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          const int jt = 2 * c + u, n = jt * 8 + 2 * qd;
+          *reinterpret_cast<float2*>(dst + p0 * S + n) = make_float2(acc[jt][0], acc[jt][1]);
+          *reinterpret_cast<float2*>(dst + (p0 + 8) * S + n) = make_float2(acc[jt][2], acc[jt][3]);
+        }
+      }
     }
     float ys[2] = {0.f, 0.f};
     if (qd < 2) {
@@ -617,7 +639,7 @@ __global__ void __launch_bounds__(THREADS, 4) mamba3_step_f32_pipe_kernel(const 
     if (valid) {
       if (t < 64) { const int r = t >> 4, c = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[r][c * 8]); }
       if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = st.x[t];
-      if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
+      if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = th;   // warp 0 holds theta[lane]
     }
     __syncthreads();   // sBk / sCb / sTheta / this small stage are reused by the next item
   }
