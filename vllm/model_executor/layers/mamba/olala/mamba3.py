@@ -79,6 +79,11 @@ _STEP_TILE_D = 64
 # with the fp32 SSM state the in-kernel preamble lengthens each CTA's serial
 # critical path more than the saved launch (-5..8% decode throughput on B300).
 _RAW_STEP = os.environ.get("OLALA_RAW_STEP", "0") == "1"
+# OLALA_STEP_SPLIT=1: at 1-2 decode tokens, the preamble-fused step with the
+# heads split over 384 CTAs (mamba3_step_split.py). Not bit-identical to the
+# default preamble + step (B/C norm reduction order, C-dot accumulation), so
+# off by default.
+_STEP_SPLIT = os.environ.get("OLALA_STEP_SPLIT", "0") == "1"
 _STEP_NUM_WARPS = 4
 
 # Fusing bias+rotary into the step kernel avoids materializing the per-head
@@ -834,6 +839,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self._pf_in_weight()  # prefill weight copy, before KV sizing
         self._decode_const_weights()
         self._raw_step_consts()
+        if _STEP_SPLIT:
+            self._split_step_consts()
         n = h.shape[0]
         if n == 0 or torch.cuda.is_current_stream_capturing():
             out.zero_()
@@ -1249,6 +1256,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # norm. They also keep DT/trap in fp32 where the eager chain rounded
         # to bf16 per op, so greedy output can differ within bf16 noise.
         fuse_preamble = self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)
+        if fuse_preamble and u.shape[0] <= 2 and self._split_step_ok(pools, out):
+            self._decode_split_step(u, out, slots, pools)
+            return
         if fuse_preamble and self._raw_step_ok(pools):
             self._decode_raw_step(u, out, slots, pools)
             return
@@ -1403,6 +1413,60 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self.dt_bias.detach().float().contiguous(),
             (self.B_norm.norm.weight.detach().float() + zc).contiguous(),
             (self.C_norm.norm.weight.detach().float() + zc).contiguous(),
+        )
+
+    def _split_step_ok(self, pools, out) -> bool:
+        if not _STEP_SPLIT or not self._in_proj_cat_ok or self._postgate_norm:
+            return False
+        from vllm.model_executor.layers.mamba.olala.mamba3_step_split import supported
+
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        return (
+            self.B_norm.norm.zero_centered
+            and self.C_norm.norm.zero_centered
+            and out.is_contiguous()
+            and out.dtype == torch.bfloat16
+            and k_pool.dtype == torch.bfloat16
+            and v_pool.dtype == torch.bfloat16
+            and angle_pool.dtype == torch.float32
+            and supported(
+                self.nheads_local,
+                self.headdim,
+                self.d_state,
+                self.mimo_dim,
+                self.num_rope_angles,
+                ssm_pool.dtype,
+                self.in_proj.weight.shape[1],
+            )
+        )
+
+    def _split_step_consts(self) -> tuple[torch.Tensor, ...]:
+        """fp32 dt_bias, raw B/C norm weights (the kernel adds 1) and D. Built
+        eagerly with the raw-step constants (see _dry_run_prefill)."""
+        c = getattr(self, "_split_consts", None)
+        if c is None:
+            c = self._split_consts = (
+                self.dt_bias.detach().float().contiguous(),
+                self.B_norm.norm.weight.detach().float().contiguous(),
+                self.C_norm.norm.weight.detach().float().contiguous(),
+                self.D.detach().float().contiguous(),
+            )
+        return c
+
+    def _decode_split_step(self, u, out, slots, pools) -> None:
+        from vllm.model_executor.layers.mamba.olala.mamba3_step_split import (
+            mamba3_step_split,
+        )
+
+        zb = decode_gemv(u, self._in_proj_cat_weight())
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        dt_bias, wb, wc, Dp = self._split_step_consts()
+        slots32 = slots.to(torch.int32).contiguous()
+        mamba3_step_split(
+            zb, ssm_pool, k_pool, v_pool, angle_pool, slots32, dt_bias,
+            self.A_floor, wb, wc, self.B_norm.norm.eps, Dp, xpj, zpj, outpj,
+            bias_q, bias_k, out,
         )
 
     def _raw_step_consts(self) -> tuple[torch.Tensor, ...]:
