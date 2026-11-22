@@ -234,6 +234,13 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # Device-side decode loop for a few greedy requests (decode_loop.py).
+        from vllm.v1.engine.decode_loop import DecodeLoopController
+
+        self.decode_loop = DecodeLoopController.maybe_create(self)
+        if self.decode_loop is not None:
+            self.step_fn = self.decode_loop.step
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []

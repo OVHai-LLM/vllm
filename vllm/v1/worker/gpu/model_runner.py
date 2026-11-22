@@ -347,6 +347,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        # Device-side decode loop (decode_loop.py), set up after graph capture.
+        self.decode_loop = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -1150,6 +1152,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         # allocator cache is counted as graph memory below.
                         torch.accelerator.empty_cache()
                     self.kv_connector.reset_capture_state()
+                    if not profile_only:
+                        from vllm.v1.worker.gpu.decode_loop import DecodeLoop
+
+                        self.decode_loop = DecodeLoop(self)
+                        self.decode_loop.capture()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
@@ -2058,6 +2065,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
+
+        if (
+            not dummy_run
+            and scheduler_output.decode_loop is not None
+            and self.decode_loop is not None
+            and self.decode_loop.can_start(
+                input_batch,
+                batch_desc.num_tokens,
+                batch_desc.cg_mode,
+                scheduler_output.decode_loop,
+            )
+        ):
+            # Run this step and the following ones on the GPU (decode_loop.py);
+            # the engine reads the tokens from the loop's host ring.
+            self.decode_loop.start(
+                input_batch, batch_desc.num_tokens, scheduler_output.decode_loop
+            )
+            self.execute_model_state = None
+            return None
 
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL

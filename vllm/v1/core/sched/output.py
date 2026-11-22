@@ -229,6 +229,16 @@ class KVConnectorBlockState:
 
 
 @dataclass
+class DecodeLoopSpec:
+    # Per request id: tokens the loop may produce (>= 1), and the token ids
+    # that end the request (EOS and stop_token_ids).
+    budgets: dict[str, int]
+    stop_ids: dict[str, list[int]]
+    # "greedy" (argmax) or "topk" (the fused top-k / top-p sampler).
+    kind: str = "greedy"
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -323,6 +333,10 @@ class SchedulerOutput:
     # (non-final prefill chunks, or requests sure to reach max_tokens), so the
     # drafter can skip proposing them.
     skip_drafts: bool = False
+
+    # Run this decode step and the following ones in the worker's device-side
+    # decode loop (vllm/v1/engine/decode_loop.py). None: a regular step.
+    decode_loop: "DecodeLoopSpec | None" = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
