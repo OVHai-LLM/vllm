@@ -500,16 +500,27 @@ def mamba3_mimo_hybrid_pools(
     else:
         _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
                                      R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
-    # The pass is serial over a sequence's chunks: long sequences want narrow P slices (more programs, shorter
-    # per-step latency: 256k 0.77 -> 0.37 ms), many short ones the wide default.
-    long_seq = _max_chunks(tuple(cu_seqlens_cpu), chunk_tokens) >= 32
-    pb = tune.get("pass_pb", 4 if long_seq else 16)
+    # The pass is serial over a sequence's chunks. With a long sequence (>= 32 chunks), one-warp programs on
+    # narrow P slices keep each serial step short (one 256k sequence: 0.77 -> 0.37 ms at PB 4); otherwise
+    # two-warp programs on wider slices. In both cases take the widest slice that still gives enough programs.
+    # One-warp variants (any PB) give the same bits, as do the two-warp PB 16 / 32 ones, but not across the two
+    # (Triton contracts the update differently; PB 8 with 2 warps is a third variant), so the warp count stays
+    # keyed on the longest sequence as before and only PB moves: bitwise identical to the previous choice
+    # (test_state_pass_slices_bitwise_identical). B300, H=48, 32k-token batches: an 8-16k prompt + short
+    # prompts 205-243 -> 150-194 us, 4 x 8k 143 -> 119 us, 8-64 short prompts 113-124 -> 101-113 us.
+    if _max_chunks(tuple(cu_seqlens_cpu), chunk_tokens) >= 32:
+        pb, nw = 4, 1
+        while pb < 16 and H * NS * (P // (2 * pb)) >= 768:
+            pb *= 2
+    else:
+        pb, nw = (32 if H * NS * (P // 32) >= 384 else 16), 2
+    pb, nw = tune.get("pass_pb", pb), tune.get("pass_nw", nw)
     _ssd_state_pass_pool[(H, NS, P // pb)](
         Sloc, dtot, asum, s_c0, s_nc, s_t0, slots, has_init if has_init is not None else slots,
         angle_pool, ssm_pool, k_pool, v_pool,
         angle_pool.stride(0), ssm_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
-        HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=tune.get("pass_nw", 1 if long_seq else 2),
+        HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=nw,
     )
     if scan_tc:
         k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)

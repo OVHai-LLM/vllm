@@ -376,3 +376,35 @@ def test_hybrid_prefill_tcgen05_vs_fp64(monkeypatch):
     assert _rel(o_tc, o_tl.double()) < 2e-2
     for x, y in zip(p_tc, p_tl):
         assert _rel(x.float(), y.double()) < 2e-2
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@torch.inference_mode()
+@pytest.mark.parametrize("init", [False, True])
+def test_state_pass_slices_bitwise_identical(init: bool, monkeypatch):
+    """The state pass picks its P slice from the batch: within each warp count
+    the choices give the same bits, so the pick never changes outputs. Large
+    angles (frequent 2 pi wraps), where one- and two-warp programs differ."""
+    from vllm.model_executor.layers.mamba.ops.mamba3 import mimo_ssd
+
+    lens = [300, 2100, 77]
+    args = _hybrid_inputs(sum(lens))
+    args[4] = args[4] * 30
+    flags = [init, False, init]
+    real = mimo_ssd.mamba3_mimo_hybrid_pools
+    for family in (((4, 1), (8, 1), (16, 1)), ((16, 2), (32, 2))):
+        ref = None
+        for pb, nw in family:
+
+            def run(*a, _t={"pass_pb": pb, "pass_nw": nw}, **k):
+                return real(*a, **k, tune=_t)
+
+            monkeypatch.setattr(mimo_ssd, "mamba3_mimo_hybrid_pools", run)
+            out, pools = _hybrid_run(args, lens, flags, mimo_ssd._SCAN_TC, monkeypatch)
+            monkeypatch.setattr(mimo_ssd, "mamba3_mimo_hybrid_pools", real)
+            if ref is None:
+                ref = (out, pools)
+                continue
+            assert torch.equal(out, ref[0]), (pb, nw)
+            for x, y in zip(pools, ref[1]):
+                assert torch.equal(x, y), (pb, nw)
