@@ -44,13 +44,24 @@ __device__ __forceinline__ void split3_x2(float x0, float x1, uint32_t& hi, uint
   mid = pack_bf16(r0, r1);
   lo = pack_bf16(r0 - __uint_as_float(mid << 16), r1 - __uint_as_float(mid & 0xffff0000u));
 }
+__device__ __forceinline__ void split2_x2(float x0, float x1, uint32_t& hi, uint32_t& lo) {
+  hi = pack_bf16(x0, x1);
+  lo = pack_bf16(x0 - __uint_as_float(hi << 16), x1 - __uint_as_float(hi & 0xffff0000u));
+}
+// x = hi + mid (+ lo): 3 bf16 terms (~fp32) for the fp32 state, 2 (16 mantissa bits, below the Q16 storage error) for Q16
+template <int NS> __device__ __forceinline__ void splitn_x2(float x0, float x1, uint32_t* t0, uint32_t* t1, uint32_t* t2) {
+  if constexpr (NS == 3) split3_x2(x0, x1, *t0, *t1, *t2); else split2_x2(x0, x1, *t0, *t1);
+}
+// Q16 mantissas are stored offset binary (u = q + 32768): one PRMT builds the float 2^23 + u, minus the magic
+__device__ __forceinline__ float i16lo(uint32_t w) { return __uint_as_float(__byte_perm(w, 0x4b00u, 0x5410)) - 8421376.f; }
+__device__ __forceinline__ float i16hi(uint32_t w) { return __uint_as_float(__byte_perm(w, 0x4b00u, 0x5432)) - 8421376.f; }
 __device__ __forceinline__ float softplus20(float v) { return v > 20.f ? v : logf(1.f + expf(v)); }
 
 struct Args {
   const __nv_bfloat16* zb; long long zb_stride; int B;   // raw in_proj output [B, N1 + NDYN]
   int* cnt;                                              // [H], zero at rest
-  float* ssm; __nv_bfloat16* kp; __nv_bfloat16* vp; float* angle; int P;
-  long long ssm_sst, kp_sst, vp_sst, ang_sst;
+  void* ssm; float* ssc; __nv_bfloat16* kp; __nv_bfloat16* vp; float* angle; int P;
+  long long ssm_sst, ssc_sst, kp_sst, vp_sst, ang_sst;
   const int* slots;
   const float* dt_bias; float a_floor; const float* wb; const float* wc; float eps;
   const float* Dp; const float* xproj; const float* zproj; const float* outproj; const float* bias_q; const float* bias_k;
@@ -64,9 +75,11 @@ template <int MAXB> struct __align__(16) Smem {
   float sTheta[MAXB][NA];
 };
 
-template <int MAXB>
+// Q: Q16 state (int16 mantissas + one fp32 scale per half row, see mamba3_step_hc.cu; same arithmetic, bit-identical)
+template <int MAXB, bool Q>
 __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a) {
   __shared__ Smem<MAXB> S_;
+  constexpr int NS = Q ? 2 : 3;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31, B = a.B;
   const int h = blockIdx.x / SPLIT, s = blockIdx.x % SPLIT;
   const int qd = lane & 3, p0 = lane >> 2, gp = s * PS + p0;   // step lanes: state row p0 of this CTA (global gp)
@@ -77,12 +90,21 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
     const int slot = b < B ? a.slots[b] : -1;
     valid[b] = slot >= 0 && slot < a.P; srow[b] = valid[b] ? slot : 0;
   }
-  float2 hst[16];                          // warp b: state row p0 of token b, columns 8 jt + 2 qd
+  float2 hst[16];                          // warp b: state row p0 of token b, columns 8 jt + 2 qd (Q16: raw mantissas)
+  float hsc[2] = {1.f, 1.f};               // Q16: scales of the two half rows
   float xs = 0.f, xpj[R], zpj[R], opj[R];  // warp b: previous x (v_pool) and the MIMO projections of row gp
   if (warp < B) {
-    const float* st = a.ssm + (size_t)srow[warp] * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
+    if constexpr (Q) {
+      const int16_t* st = reinterpret_cast<const int16_t*>(a.ssm) + (size_t)srow[warp] * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
 #pragma unroll
-    for (int jt = 0; jt < 16; ++jt) hst[jt] = __ldcs(reinterpret_cast<const float2*>(st + jt * 8));
+      for (int jt = 0; jt < 16; ++jt) { const uint32_t w = __ldcs(reinterpret_cast<const unsigned*>(st + jt * 8)); hst[jt] = make_float2(i16lo(w), i16hi(w)); }
+      const float* sp = a.ssc + (size_t)srow[warp] * a.ssc_sst + ((size_t)h * D + gp) * 2;
+      hsc[0] = sp[0]; hsc[1] = sp[1];
+    } else {
+      const float* st = reinterpret_cast<const float*>(a.ssm) + (size_t)srow[warp] * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) hst[jt] = __ldcs(reinterpret_cast<const float2*>(st + jt * 8));
+    }
     xs = bf2f(a.vp[(size_t)srow[warp] * a.vp_sst + (size_t)h * D + gp]);
   }
 #pragma unroll
@@ -190,7 +212,10 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
     for (int j = 0; j < MAXB; ++j) if (j == b) { al = alpha[j]; ga = gamma[j]; be = beta[j]; }
     float acc[16][4];
 #pragma unroll
-    for (int jt = 0; jt < 16; ++jt) { acc[jt][0] = al * hst[jt].x; acc[jt][1] = al * hst[jt].y; acc[jt][2] = 0.f; acc[jt][3] = 0.f; }
+    for (int jt = 0; jt < 16; ++jt) {
+      const float f = Q ? al * hsc[jt >> 3] : al;
+      acc[jt][0] = f * hst[jt].x; acc[jt][1] = f * hst[jt].y; acc[jt][2] = 0.f; acc[jt][3] = 0.f;
+    }
     uint32_t ah[3][4];
     {
       float av[2];
@@ -202,7 +227,7 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
         for (int r = 1; r < R; ++r) if ((kk & 3) == r) xr = xpj[r];
         av[jj] = (kk < 4) ? ga * xp * xr : be * xs * xr;
       }
-      split3_x2(av[0], av[1], ah[0][0], ah[1][0], ah[2][0]);
+      splitn_x2<NS>(av[0], av[1], &ah[0][0], &ah[1][0], &ah[2][0]);
 #pragma unroll
       for (int q = 0; q < 3; ++q) { ah[q][1] = 0u; ah[q][2] = 0u; ah[q][3] = 0u; }
     }
@@ -213,7 +238,7 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                    : "=r"(bfr[0]), "=r"(bfr[1]), "=r"(bfr[2]), "=r"(bfr[3]) : "r"(smem_u32(&S_.sBk[b][li][jp * 16 + (mi >> 1) * 8])));
 #pragma unroll
-      for (int q = 2; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
+      for (int q = NS - 1; q >= 0; --q) { mma16816(acc[2 * jp], ah[q], bfr); mma16816(acc[2 * jp + 1], ah[q], bfr + 2); }
     }
     bool vb = false;
 #pragma unroll
@@ -221,10 +246,34 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
     int slot_b = 0;
 #pragma unroll
     for (int j = 0; j < MAXB; ++j) if (j == b) slot_b = srow[j];
-    if (vb) {
-      float* dst = a.ssm + (size_t)slot_b * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
+    if constexpr (Q) {   // all lanes take part in the half-row max shuffles
+      float m[2] = {0.f, 0.f};
 #pragma unroll
-      for (int jt = 0; jt < 16; ++jt) __stcs(reinterpret_cast<float2*>(dst + jt * 8), make_float2(acc[jt][0], acc[jt][1]));
+      for (int jt = 0; jt < 16; ++jt) m[jt >> 3] = fmaxf(m[jt >> 3], fmaxf(fabsf(acc[jt][0]), fabsf(acc[jt][1])));
+#pragma unroll
+      for (int e = 0; e < 2; ++e) { m[e] = fmaxf(m[e], __shfl_xor_sync(0xffffffffu, m[e], 1)); m[e] = fmaxf(m[e], __shfl_xor_sync(0xffffffffu, m[e], 2)); }
+      if (vb) {
+        int16_t* dst = reinterpret_cast<int16_t*>(a.ssm) + (size_t)slot_b * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          // as mamba3_step_hc: approximate reciprocal (|h| * inv rounds to <= 32767), q = rint(h * inv) in one FFMA
+          float sc = m[e] * 3.0518509475997192e-05f;
+          if (!(sc >= 1.17549435e-38f)) sc = 1.f;   // zero (or a sub-FLT_MIN half: rcp.ftz would give inf) -> q = 0
+          float inv; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(sc));
+#pragma unroll
+          for (int jt = 8 * e; jt < 8 * e + 8; ++jt)
+            __stcs(reinterpret_cast<unsigned*>(dst + jt * 8), __byte_perm(__float_as_uint(__fmaf_rn(acc[jt][0], inv, 12615680.f)),
+                                                                      __float_as_uint(__fmaf_rn(acc[jt][1], inv, 12615680.f)), 0x5410));
+          if (qd == 0) a.ssc[(size_t)slot_b * a.ssc_sst + ((size_t)h * D + gp) * 2 + e] = sc;
+        }
+      }
+    }
+    if (vb) {
+      if constexpr (!Q) {
+        float* dst = reinterpret_cast<float*>(a.ssm) + (size_t)slot_b * a.ssm_sst + ((size_t)h * D + gp) * S + 2 * qd;
+#pragma unroll
+        for (int jt = 0; jt < 16; ++jt) __stcs(reinterpret_cast<float2*>(dst + jt * 8), make_float2(acc[jt][0], acc[jt][1]));
+      }
       if (qd == 0) a.vp[(size_t)slot_b * a.vp_sst + (size_t)h * D + gp] = __float2bfloat16(xp);
     }
     float oc[4][4];
@@ -237,9 +286,9 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
       const float* v[4] = {&acc[2 * c][0], &acc[2 * c][2], &acc[2 * c + 1][0], &acc[2 * c + 1][2]};
       uint32_t a3[3][4];
 #pragma unroll
-      for (int q = 0; q < 4; ++q) split3_x2(v[q][0], v[q][1], a3[0][q], a3[1][q], a3[2][q]);
+      for (int q = 0; q < 4; ++q) splitn_x2<NS>(v[q][0], v[q][1], &a3[0][q], &a3[1][q], &a3[2][q]);
 #pragma unroll
-      for (int q = 2; q >= 0; --q) mma16816(oc[c & 3], a3[q], bfr);
+      for (int q = NS - 1; q >= 0; --q) mma16816(oc[c & 3], a3[q], bfr);
     }
     float ys = 0.f;
     if (qd < 2) {
@@ -275,14 +324,15 @@ __global__ void __launch_bounds__(THREADS) mamba3_step_split_kernel(const Args a
 }
 }  // namespace
 
-void mamba3_step_split(torch::Tensor zb, torch::Tensor cnt, torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tensor v_pool,
-                       torch::Tensor angle_pool, torch::Tensor slots, torch::Tensor dt_bias, double a_floor, torch::Tensor wb,
+void mamba3_step_split(torch::Tensor zb, torch::Tensor cnt, torch::Tensor ssm_pool, std::optional<torch::Tensor> ssm_scale,
+                       torch::Tensor k_pool, torch::Tensor v_pool, torch::Tensor angle_pool, torch::Tensor slots, torch::Tensor dt_bias, double a_floor, torch::Tensor wb,
                        torch::Tensor wc, double eps, torch::Tensor Dp, torch::Tensor xproj, torch::Tensor zproj, torch::Tensor outproj,
                        torch::Tensor bias_q, torch::Tensor bias_k, torch::Tensor y, bool pdl) {
   Args a;
   a.zb = reinterpret_cast<const __nv_bfloat16*>(zb.data_ptr()); a.zb_stride = zb.stride(0); a.B = zb.size(0);
   a.cnt = cnt.data_ptr<int>();
-  a.ssm = ssm_pool.data_ptr<float>(); a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
+  const bool q16 = ssm_pool.dtype() == torch::kInt16;
+  a.ssm = ssm_pool.data_ptr(); a.ssc = nullptr; a.ssc_sst = 0; a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
   a.angle = angle_pool.data_ptr<float>(); a.P = ssm_pool.size(0);
   a.ssm_sst = ssm_pool.stride(0); a.kp_sst = k_pool.stride(0); a.vp_sst = v_pool.stride(0); a.ang_sst = angle_pool.stride(0);
   a.slots = slots.data_ptr<int>();
@@ -291,7 +341,12 @@ void mamba3_step_split(torch::Tensor zb, torch::Tensor cnt, torch::Tensor ssm_po
   a.bias_q = bias_q.data_ptr<float>(); a.bias_k = bias_k.data_ptr<float>();
   a.y = reinterpret_cast<__nv_bfloat16*>(y.data_ptr()); a.y_stride = y.stride(0); a.pdl = pdl ? 1 : 0;
   TORCH_CHECK(a.B >= 1 && a.B <= 4 && zb.size(1) == N1 + NDYN && zb.stride(1) == 1 && zb.dtype() == torch::kBFloat16 && cnt.numel() >= H);
-  TORCH_CHECK(ssm_pool.dtype() == torch::kFloat32 && ssm_pool.stride(1) == D * S && ssm_pool.stride(2) == S && ssm_pool.stride(3) == 1);
+  TORCH_CHECK((q16 || ssm_pool.dtype() == torch::kFloat32) && ssm_pool.stride(1) == D * S && ssm_pool.stride(2) == S && ssm_pool.stride(3) == 1);
+  if (q16) {
+    TORCH_CHECK(ssm_scale.has_value() && ssm_scale->dtype() == torch::kFloat32 && ssm_scale->size(0) == a.P && ssm_scale->stride(1) == D * 2 &&
+                ssm_scale->stride(2) == 2 && ssm_scale->stride(3) == 1, "Q16 needs scales [P, H, D, 2] fp32");
+    a.ssc = ssm_scale->data_ptr<float>(); a.ssc_sst = ssm_scale->stride(0);
+  }
   TORCH_CHECK(k_pool.stride(1) == H * S && k_pool.stride(2) == S && v_pool.stride(1) == D && angle_pool.stride(1) == NA);
   TORCH_CHECK((a.kp_sst * 2) % 16 == 0 && (a.ssm_sst * 4) % 8 == 0);
   TORCH_CHECK(wb.dtype() == torch::kFloat32 && wc.dtype() == torch::kFloat32 && bias_q.dtype() == torch::kFloat32 && xproj.dtype() == torch::kFloat32);
@@ -303,12 +358,18 @@ void mamba3_step_split(torch::Tensor zb, torch::Tensor cnt, torch::Tensor ssm_po
     cfg.attrs = attr; cfg.numAttrs = pdl ? 1 : 0;
     cudaLaunchKernelEx(&cfg, kernel, a);
   };
-  if (a.B == 1) launch(mamba3_step_split_kernel<1>);
-  else if (a.B == 2) launch(mamba3_step_split_kernel<2>);
-  else launch(mamba3_step_split_kernel<4>);
+  if (q16) {
+    if (a.B == 1) launch(mamba3_step_split_kernel<1, true>);
+    else if (a.B == 2) launch(mamba3_step_split_kernel<2, true>);
+    else launch(mamba3_step_split_kernel<4, true>);
+  } else {
+    if (a.B == 1) launch(mamba3_step_split_kernel<1, false>);
+    else if (a.B == 2) launch(mamba3_step_split_kernel<2, false>);
+    else launch(mamba3_step_split_kernel<4, false>);
+  }
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("step", &mamba3_step_split, py::arg("zb"), py::arg("cnt"), py::arg("ssm"), py::arg("kp"), py::arg("vp"), py::arg("angle"),
+  m.def("step", &mamba3_step_split, py::arg("zb"), py::arg("cnt"), py::arg("ssm"), py::arg("ssm_scale"), py::arg("kp"), py::arg("vp"), py::arg("angle"),
         py::arg("slots"), py::arg("dt_bias"), py::arg("a_floor"), py::arg("wb"), py::arg("wc"), py::arg("eps"), py::arg("Dp"),
         py::arg("xproj"), py::arg("zproj"), py::arg("outproj"), py::arg("bias_q"), py::arg("bias_k"), py::arg("y"), py::arg("pdl") = false);
 }

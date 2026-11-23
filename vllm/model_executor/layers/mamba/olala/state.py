@@ -5,7 +5,8 @@
 Olala carries two kinds of paged recurrent state, both allocated through
 ``MambaSpec`` so vLLM's state manager owns the per-request slots:
 
-* Mamba3 MIMO (``M`` layers) — four temporal tensors.
+* Mamba3 MIMO (``M`` layers) — four temporal tensors (five with the Q16
+  SSM state: its scales follow).
 * Differential-TPA token shift (``V`` layers) — a one-token ``(k, v)``
   buffer holding the previous token's raw (pre-shift) key/value.
 
@@ -72,6 +73,24 @@ def replay_config() -> ReplayConfig | None:
     return ReplayConfig(buffer_len=L, read_fp8=read == "fp8")
 
 
+@lru_cache(maxsize=1)
+def q16_enabled() -> bool:
+    """``OLALA_SSM_Q16=1``: the Mamba3 SSM state is stored as Q16, int16
+    mantissas in offset binary (u = q + 32768) plus one fp32 scale per half
+    row of 64 values (scale ~ max|h| / 32767, q = rint(h / scale), see
+    ``mamba3_step_hc.q16_quantize``): 16.5 bits per value instead of 32,
+    relative error ~3e-5 (bf16 rounding: ~4e-3). Over 6 x 3000 teacher-forced
+    decode steps the NLL equals the fp32 state's (1.7650; bf16 1.7991). The
+    kernels dequantize on load and requantize on store, so all arithmetic
+    stays fp32. The scales are an extra state tensor ``(nh, head_dim, 2)``
+    after ``v``. Replaces the fp32 state (``--mamba-ssm-cache-dtype`` auto or
+    float32); not combined with ReplaySSM."""
+    on = os.environ.get("OLALA_SSM_Q16", "0").strip().lower() in ("1", "on", "true", "yes")
+    if on and replay_config() is not None:
+        raise ValueError("OLALA_SSM_Q16 and OLALA_REPLAY_SSM are mutually exclusive")
+    return on
+
+
 def mamba3_state_dtype(
     model_dtype: ModelDType | torch.dtype,
     mamba_cache_dtype: MambaDType,
@@ -91,6 +110,13 @@ def mamba3_state_dtype(
     """
     state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
     rc = replay_config()
+    if q16_enabled():
+        if mamba_ssm_cache_dtype not in ("auto", "float32"):
+            raise ValueError(
+                "OLALA_SSM_Q16 replaces the fp32 SSM state; got "
+                f"--mamba-ssm-cache-dtype {mamba_ssm_cache_dtype}"
+            )
+        return (torch.float32, torch.int16, state_dtype, state_dtype, torch.float32)
     if mamba_ssm_cache_dtype == "auto":
         # ReplaySSM rounds its anchor once per window, not every step: bf16
         # holds fp32 quality there (see ReplayConfig)
@@ -113,7 +139,8 @@ def mamba3_state_shape(
     mimo_dim: int,
     num_rope_angles: int,
 ) -> tuple[tuple[int, ...], ...]:
-    """Shapes of ``(angle, ssm, k, v)`` per request slot.
+    """Shapes of ``(angle, ssm, k, v)`` per request slot, then the Q16 scales
+    ``(nh, head_dim, 2)`` if ``OLALA_SSM_Q16`` is on.
 
     With ReplaySSM, ``ssm`` is the checkpoint anchor and the ring follows:
     ``x (nh, L, head_dim)``, the biased + rotated ``B' (nh, L, mimo_dim,
@@ -129,6 +156,8 @@ def mamba3_state_shape(
         (mimo_dim, nh, d_state),
         (nh, head_dim),
     )
+    if q16_enabled():
+        return shapes + ((nh, head_dim, 2),)
     rc = replay_config()
     if rc is not None:
         L = rc.buffer_len

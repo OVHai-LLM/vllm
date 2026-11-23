@@ -44,7 +44,7 @@ def supported(
 ) -> bool:
     return (
         (num_heads, head_dim, d_state, rank, num_angles) == (48, 64, 128, 4, 32)
-        and ssm_dtype == torch.float32
+        and ssm_dtype in (torch.float32, torch.int16)
         and hidden == 1536
     )
 
@@ -68,14 +68,18 @@ def mamba3_step_split(
     bias_q,
     bias_k,
     y,
+    ssm_scale=None,
 ) -> None:
     """zb: (N, 6288 + 1056) bf16 in_proj output, N <= 4; wb / wc: fp32 B / C
     norm weights; xproj / zproj / outproj / bias_q / bias_k: fp32 (r, h, n)
-    layouts; y: (N, 3072) bf16."""
+    layouts; y: (N, 3072) bf16. ssm_pool fp32, or int16 (Q16, see
+    mamba3_step_hc.py) with ssm_scale (P, H, D, 2) fp32; Q16 gives the same bits
+    as mamba3_step_hc."""
     _load().step(
         zb,
         _counters(zb.device),
         ssm_pool,
+        ssm_scale,
         k_pool,
         v_pool,
         angle_pool,

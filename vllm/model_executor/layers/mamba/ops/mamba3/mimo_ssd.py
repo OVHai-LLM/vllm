@@ -37,6 +37,7 @@ import functools
 import torch
 
 from vllm.triton_utils import tl, triton
+from triton.language.extra import libdevice
 
 import os as _os
 
@@ -277,6 +278,55 @@ def _ssd_abs_angles(thl_ptr, Ain_ptr, ch_start_ptr, ch_len_ptr, out_ptr, H, NQ: 
 
 
 @triton.jit
+def _q16_load_init(
+    q_pool, sc_pool, ang_pool, k_pool, v_pool, s_q, s_sc, s_ang, s_k, s_v, slots_ptr, hinit_ptr,
+    ssm_o, ang_o, k_o, v_o, H,
+    R: tl.constexpr, N: tl.constexpr, P: tl.constexpr, NQ: tl.constexpr,
+):
+    """Q16 pools -> the state pass's per-sequence fp32 inputs (sequences with an initial state only):
+    the dequantized SSM state h = (u - 32768) * scale (u offset binary, one scale per half row of 64)
+    and copies of the angle / previous B' / previous x rows. One program per (sequence, head)."""
+    s = tl.program_id(0)
+    h = tl.program_id(1)
+    if tl.load(hinit_ptr + s) != 0:
+        slot = tl.load(slots_ptr + s).to(tl.int64)
+        p = tl.arange(0, P)
+        n = tl.arange(0, N // 2)
+        so = s.to(tl.int64)
+        for hf in tl.static_range(2):
+            u = tl.load(q_pool + slot * s_q + (h * P + p[:, None]) * N + hf * (N // 2) + n[None, :])
+            sc = tl.load(sc_pool + slot * s_sc + (h * P + p) * 2 + hf)
+            x = (u.to(tl.int32) ^ -32768).to(tl.float32) * sc[:, None]
+            tl.store(ssm_o + (so * H + h) * P * N + p[:, None] * N + hf * (N // 2) + n[None, :], x)
+        nq = tl.arange(0, NQ)
+        tl.store(ang_o + (so * H + h) * NQ + nq, tl.load(ang_pool + slot * s_ang + h * NQ + nq))
+        nn = tl.arange(0, N)
+        for r in tl.static_range(R):
+            tl.store(k_o + ((so * R + r) * H + h) * N + nn, tl.load(k_pool + slot * s_k + (r * H + h) * N + nn))
+        tl.store(v_o + (so * H + h) * P + p, tl.load(v_pool + slot * s_v + h * P + p))
+
+
+@triton.jit
+def _q16_store_final(ssm_i, q_pool, sc_pool, s_q, s_sc, slots_ptr, H, N: tl.constexpr, P: tl.constexpr):
+    """The state pass's fp32 final states -> the Q16 pool slots: per half row of 64, scale = max|h| / 32767
+    (IEEE division; zero or below FLT_MIN -> 1, q = 0) and u = rint(h * (1 / scale)) + 32768. One program
+    per (sequence, head)."""
+    s = tl.program_id(0)
+    h = tl.program_id(1)
+    slot = tl.load(slots_ptr + s).to(tl.int64)
+    p = tl.arange(0, P)
+    n = tl.arange(0, N // 2)
+    for hf in tl.static_range(2):
+        x = tl.load(ssm_i + (s.to(tl.int64) * H + h) * P * N + p[:, None] * N + hf * (N // 2) + n[None, :])
+        sc = tl.math.div_rn(tl.max(tl.abs(x), axis=1), tl.full([P], 32767.0, tl.float32))
+        sc = tl.where(sc >= 1.1754943508222875e-38, sc, 1.0)
+        inv = tl.math.div_rn(tl.full([P], 1.0, tl.float32), sc)
+        q = libdevice.rint(x * inv[:, None]).to(tl.int32) ^ 32768
+        tl.store(q_pool + slot * s_q + (h * P + p[:, None]) * N + hf * (N // 2) + n[None, :], q.to(tl.int16))
+        tl.store(sc_pool + slot * s_sc + (h * P + p) * 2 + hf, sc)
+
+
+@triton.jit
 def _ssd_state_pass_pool(
     Sloc_ptr, dtot_ptr, asum_ptr, seq_c0_ptr, seq_nc_ptr, seq_t0_ptr,
     slots_ptr, hinit_ptr,
@@ -436,10 +486,16 @@ def mamba3_mimo_hybrid_pools(
     tune: dict | None = None,
 ):
     """:func:`mamba3_mimo_hybrid` reading the entering states from and writing the final states to
-    the request pool slots in place (``has_init`` None: every sequence starts from zero)."""
+    the request pool slots in place (``has_init`` None: every sequence starts from zero).
+
+    ``pools`` = (angle, ssm, k, v) or, for the Q16 SSM state (int16 offset-binary mantissas, see
+    olala/mamba3_step_hc.py), (angle, ssm, k, v, scales): the state pass then runs unchanged on fp32
+    per-sequence copies (dequantized entering states, quantized into the slots afterwards), so the
+    prefill outputs are bitwise those of an fp32 pool holding the dequantized states."""
     from .mimo_fwd_varlen import mamba_mimo_forward_varlen
     from .segsum import compute_dacs_segsum_triton_varlen
-    angle_pool, ssm_pool, k_pool, v_pool = pools
+    angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
+    ssc_pool = pools[4] if len(pools) > 4 else None
     T, R, N = Q.shape
     H, P = V.shape[1], V.shape[2]
     NQ = N // 4
@@ -515,13 +571,34 @@ def mamba3_mimo_hybrid_pools(
     else:
         pb, nw = (32 if H * NS * (P // 32) >= 384 else 16), 2
     pb, nw = tune.get("pass_pb", pb), tune.get("pass_nw", nw)
+    pass_pools, pass_slots = (angle_pool, ssm_pool, k_pool, v_pool), slots
+    if ssc_pool is not None:
+        # Q16: the same pass kernel (same bits) on per-sequence fp32 rows (no larger than SinT)
+        pass_slots = torch.arange(NS, device=dev, dtype=torch.int32)
+        ssm_s = torch.empty(NS, H, P, N, **f32)
+        if has_init is not None:
+            ang_s = torch.empty(NS, H, NQ, **f32)
+            k_s = torch.empty(NS, R, H, N, device=dev, dtype=k_pool.dtype)
+            v_s = torch.empty(NS, H, P, device=dev, dtype=v_pool.dtype)
+            _q16_load_init[(NS, H)](
+                ssm_pool, ssc_pool, angle_pool, k_pool, v_pool, ssm_pool.stride(0), ssc_pool.stride(0),
+                angle_pool.stride(0), k_pool.stride(0), v_pool.stride(0), slots, has_init,
+                ssm_s, ang_s, k_s, v_s, H, R=R, N=N, P=P, NQ=NQ, num_warps=4,
+            )
+            pass_pools = (ang_s, ssm_s, k_s, v_s)
+        else:
+            pass_pools = (angle_pool, ssm_s, k_pool, v_pool)  # only the SSM rows are touched
+    ap, sp, kp, vp = pass_pools
     _ssd_state_pass_pool[(H, NS, P // pb)](
-        Sloc, dtot, asum, s_c0, s_nc, s_t0, slots, has_init if has_init is not None else slots,
-        angle_pool, ssm_pool, k_pool, v_pool,
-        angle_pool.stride(0), ssm_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
+        Sloc, dtot, asum, s_c0, s_nc, s_t0, pass_slots, has_init if has_init is not None else pass_slots,
+        ap, sp, kp, vp,
+        ap.stride(0), sp.stride(0), kp.stride(0), vp.stride(0),
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
         HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=nw,
     )
+    if ssc_pool is not None:
+        _q16_store_final[(NS, H)](sp, ssm_pool, ssc_pool, ssm_pool.stride(0), ssc_pool.stride(0), slots, H,
+                                  N=N, P=P, num_warps=4)
     if scan_tc:
         k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
         _scan_tc_ext().scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,

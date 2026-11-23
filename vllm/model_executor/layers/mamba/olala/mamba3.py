@@ -57,6 +57,7 @@ from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
 from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
     mamba3_state_shape,
+    q16_enabled,
     replay_config,
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
@@ -84,6 +85,12 @@ _RAW_STEP = os.environ.get("OLALA_RAW_STEP", "0") == "1"
 # default preamble + step (B/C norm reduction order, C-dot accumulation), so
 # off by default.
 _STEP_SPLIT = os.environ.get("OLALA_STEP_SPLIT", "0") == "1"
+# OLALA_STEP_HC_MIN=<n> (0 = off): fp32 state, from n decode tokens on, the
+# preamble-fused large-batch step (mamba3_step_hc.py, one CTA per head that
+# prefetches its next token). Same arithmetic as mamba3_step_split (bitwise),
+# so not bit-identical to the default step either. The Q16 state
+# (OLALA_SSM_Q16) always takes the split / hc kernels.
+_STEP_HC_MIN = int(os.environ.get("OLALA_STEP_HC_MIN", "0"))
 _STEP_NUM_WARPS = 4
 
 # Fusing bias+rotary into the step kernel avoids materializing the per-head
@@ -520,6 +527,34 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self.output_norm = OlalaNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
             set_weight_attrs(self.output_norm.norm.weight, head_shard)
 
+        # OLALA_SSM_Q16: int16 SSM state + per-half-row scales (state.py); the
+        # scales are pool 4. Only the split / hc decode steps and the pooled
+        # prefill state pass read and write that format.
+        self._q16 = q16_enabled()
+        self._n_pools = 5 if self._q16 else 4
+        if self._q16:
+            from vllm.model_executor.layers.mamba.olala.mamba3_step_hc import (
+                supported as hc_supported,
+            )
+
+            if vllm_config.speculative_config is not None:
+                raise ValueError("OLALA_SSM_Q16 does not support speculative decoding.")
+            if not (
+                self._hybrid_ok
+                and self._in_proj_cat_ok
+                and not self._postgate_norm
+                and zc
+                and hc_supported(
+                    self.nheads_local, self.headdim, self.d_state, self.mimo_dim,
+                    self.num_rope_angles, self.in_proj.weight.shape[1],
+                )
+            ):
+                raise ValueError(
+                    "OLALA_SSM_Q16 needs the Olala 7A1B Mamba3 shapes on one GPU "
+                    "(48 heads, headdim 64, d_state 128, mimo 4, 32 angles, "
+                    "zero-centered B/C norms, no post-gate norm)."
+                )
+
         self._replay = replay_config()
         if self._replay is not None:
             if vllm_config.speculative_config is not None:
@@ -563,7 +598,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # The CuteDSL step kernel indexes the pools in place, so their dtypes
         # are a hard precondition rather than something we can cast around.
         _, ssm_dtype, k_dtype, v_dtype = dtypes[:4]
-        if ssm_dtype not in (torch.float32, torch.bfloat16):
+        if ssm_dtype not in (torch.float32, torch.bfloat16) and not (
+            self._q16 and ssm_dtype == torch.int16
+        ):
             raise ValueError(
                 f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
                 f"{ssm_dtype}. Set --mamba-ssm-cache-dtype to float32 or auto."
@@ -666,7 +703,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
         all_pools = self.kv_cache
-        pools = tuple(all_pools[:4])  # (angle, ssm, k, v); ReplaySSM tensors follow
+        # (angle, ssm, k, v[, Q16 scales]); ReplaySSM tensors follow
+        pools = tuple(all_pools[: self._n_pools])
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
@@ -839,7 +877,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self._pf_in_weight()  # prefill weight copy, before KV sizing
         self._decode_const_weights()
         self._raw_step_consts()
-        if _STEP_SPLIT:
+        if _STEP_SPLIT or _STEP_HC_MIN or self._q16:
             self._split_step_consts()
         n = h.shape[0]
         if n == 0 or torch.cuda.is_current_stream_capturing():
@@ -848,7 +886,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         pools = tuple(
             torch.zeros((1, *shape), dtype=dtype, device=h.device)
             for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
-        )[:4]
+        )[: self._n_pools]
         slots = torch.zeros(1, dtype=torch.long, device=h.device)
         qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
         self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
@@ -983,7 +1021,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         out.copy_(y.to(out.dtype))
 
     def _prefill_hybrid(self, h, out, slots, qsl, pools, has_init, qsl_cpu):
-        angle_pool, ssm_pool, k_pool, v_pool = pools
+        # pools: (angle, ssm, k, v[, Q16 scales]); mamba3_mimo_hybrid_pools
+        # converts the Q16 state around its (unchanged) state pass
         T = h.shape[0]
         H, D, R, S = self.nheads_local, self.headdim, self.mimo_dim, self.d_state
         dev, dt_ = h.device, h.dtype
@@ -1049,7 +1088,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if qsl_cpu is None:
             qsl_cpu = qsl.cpu()
         cu = [int(v) for v in qsl_cpu.tolist()]
-        angle_pool, ssm_pool, k_pool, v_pool = pools
+        angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
         assert (ssm_pool.stride()[1:] == (D * S, S, 1) and k_pool.stride()[1:] == (H * S, S, 1)
                 and v_pool.stride()[1:] == (D, 1) and angle_pool.stride()[1:] == (self.num_rope_angles, 1))
         direct = not self._postgate_norm and out.dtype == x.dtype and out.is_contiguous()
@@ -1247,6 +1286,15 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         slots: torch.Tensor,  # (N,)
         pools: tuple[torch.Tensor, ...],
     ) -> None:
+        if self._q16 or (
+            _STEP_HC_MIN
+            and u.shape[0] >= _STEP_HC_MIN
+            and self._split_step_ok(pools, out, force=True)
+        ):
+            # Q16 (and opt-in fp32 at large batch): preamble-fused steps, the
+            # split kernel at 1 token, the prefetching per-head one above
+            self._decode_fused_step(u, out, slots, pools)
+            return
         angle_pool, ssm_pool, k_pool, v_pool = pools
         H, D = self.nheads_local, self.headdim
         R, S = self.mimo_dim, self.d_state
@@ -1415,12 +1463,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             (self.C_norm.norm.weight.detach().float() + zc).contiguous(),
         )
 
-    def _split_step_ok(self, pools, out) -> bool:
-        if not _STEP_SPLIT or not self._in_proj_cat_ok or self._postgate_norm:
+    def _split_step_ok(self, pools, out, force: bool = False) -> bool:
+        if not (_STEP_SPLIT or force) or not self._in_proj_cat_ok or self._postgate_norm:
             return False
         from vllm.model_executor.layers.mamba.olala.mamba3_step_split import supported
 
-        angle_pool, ssm_pool, k_pool, v_pool = pools
+        angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
         return (
             self.B_norm.norm.zero_centered
             and self.C_norm.norm.zero_centered
@@ -1453,6 +1501,29 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             )
         return c
 
+    def _decode_fused_step(self, u, out, slots, pools) -> None:
+        """in_proj GEMV / GEMM, then one preamble-fused step launch:
+        mamba3_step_split at 1 token (fp32: 1-2), mamba3_step_hc above. Reads
+        and writes the fp32 or the Q16 state (pools[4] = scales). B300, one
+        layer graphed, Q16: B = 1 split 5.1 us / hc 5.2; B = 2 hc 5.3 / split 6.8."""
+        n = u.shape[0]
+        if n <= (1 if self._q16 else 2):
+            self._decode_split_step(u, out, slots, pools)
+            return
+        from vllm.model_executor.layers.mamba.olala.mamba3_step_hc import (
+            mamba3_step_hc,
+        )
+
+        zb = decode_gemv(u, self._in_proj_cat_weight())
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
+        angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
+        dt_bias, wb, wc, Dp = self._split_step_consts()
+        mamba3_step_hc(
+            zb, ssm_pool, k_pool, v_pool, angle_pool, slots.to(torch.int32).contiguous(),
+            dt_bias, self.A_floor, wb, wc, self.B_norm.norm.eps, Dp, xpj, zpj, outpj,
+            bias_q, bias_k, out, ssm_scale=pools[4] if len(pools) > 4 else None,
+        )
+
     def _decode_split_step(self, u, out, slots, pools) -> None:
         from vllm.model_executor.layers.mamba.olala.mamba3_step_split import (
             mamba3_step_split,
@@ -1460,13 +1531,13 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
         zb = decode_gemv(u, self._in_proj_cat_weight())
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
-        angle_pool, ssm_pool, k_pool, v_pool = pools
+        angle_pool, ssm_pool, k_pool, v_pool = pools[:4]
         dt_bias, wb, wc, Dp = self._split_step_consts()
         slots32 = slots.to(torch.int32).contiguous()
         mamba3_step_split(
             zb, ssm_pool, k_pool, v_pool, angle_pool, slots32, dt_bias,
             self.A_floor, wb, wc, self.B_norm.norm.eps, Dp, xpj, zpj, outpj,
-            bias_q, bias_k, out,
+            bias_q, bias_k, out, ssm_scale=pools[4] if len(pools) > 4 else None,
         )
 
     def _raw_step_consts(self) -> tuple[torch.Tensor, ...]:
