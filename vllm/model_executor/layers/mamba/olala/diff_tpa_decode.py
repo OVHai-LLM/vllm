@@ -93,20 +93,25 @@ def _tpa_diff_combine_kernel(
     attn_ptr,          # (N, Hkv*(SNR+1)*D) contiguous
     lam_ptr, sl_n,     # lambda logits (N, Hkv): row stride
     out_ptr, so_n,     # (N, Hkv*SNR*D): row stride
+    HKV: tl.constexpr,
+    HP: tl.constexpr,
     SNR: tl.constexpr,
     D: tl.constexpr,
 ):
-    n = tl.program_id(0)
-    h = tl.program_id(1)
+    """One token per program, all kv heads as one [HP, D] tile per signal head."""
+    n = tl.program_id(0).to(tl.int64)
+    hh = tl.arange(0, HP)
+    hm = hh[:, None] < HKV
     offs = tl.arange(0, D)
-    base = attn_ptr + n * tl.num_programs(1) * (SNR + 1) * D + h * (SNR + 1) * D
-    noi = tl.load(base + SNR * D + offs).to(tl.float32)
-    lam = tl.load(lam_ptr + n * sl_n + h).to(tl.float32)
+    base = attn_ptr + n * HKV * (SNR + 1) * D + hh[:, None] * (SNR + 1) * D + offs[None, :]
+    noi = tl.load(base + SNR * D, mask=hm, other=0.0).to(tl.float32)
+    lam = tl.load(lam_ptr + n * sl_n + hh, mask=hh < HKV, other=0.0).to(tl.float32)
     s = tl.sigmoid(lam).to(tl.bfloat16).to(tl.float32)
-    t = (s * noi).to(tl.bfloat16).to(tl.float32)
-    for j in range(SNR):
-        sig = tl.load(base + j * D + offs).to(tl.float32)
-        tl.store(out_ptr + n * so_n + (h * SNR + j) * D + offs, (sig - t).to(out_ptr.dtype.element_ty))
+    t = (s[:, None] * noi).to(tl.bfloat16).to(tl.float32)
+    obase = out_ptr + n * so_n + hh[:, None] * SNR * D + offs[None, :]
+    for j in tl.static_range(SNR):
+        sig = tl.load(base + j * D, mask=hm, other=0.0).to(tl.float32)
+        tl.store(obase + j * D, (sig - t).to(out_ptr.dtype.element_ty), mask=hm)
 
 
 def tpa_decode_qkv(q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions, slots,
@@ -132,7 +137,9 @@ def tpa_decode_qkv(q_all, A_k, A_v, B_k, B_v, alpha_k, alpha_v, positions, slots
 
 def tpa_diff_combine(attn_out, lam_all, out, hkv, snr, d):
     n = attn_out.shape[0]
-    _tpa_diff_combine_kernel[(n, hkv)](
+    if n == 0:
+        return
+    _tpa_diff_combine_kernel[(n,)](
         attn_out, lam_all, lam_all.stride(0), out, out.stride(0),
-        SNR=snr, D=d, num_warps=2,
+        HKV=hkv, HP=triton.next_power_of_2(hkv), SNR=snr, D=d, num_warps=8,
     )

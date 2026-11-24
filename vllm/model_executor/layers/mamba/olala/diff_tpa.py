@@ -52,10 +52,11 @@ from vllm.model_executor.layers.mamba.olala.tpa_factor import (
     reconstruct_dense_kv,
     write_rows,
 )
-from vllm.model_executor.layers.mamba.olala.tpa_prefill import tpa_prefill_q, tpa_prefill_rows
-from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_varlen_func,
-    get_flash_attn_version,
+from vllm.model_executor.layers.mamba.olala.tpa_prefill import (
+    prefill_q_prescale,
+    tpa_prefill_q,
+    tpa_prefill_rows,
+    tpa_varlen_attention,
 )
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention.attention import Attention
@@ -665,13 +666,16 @@ class OlalaDiffTPAAttention(PluggableLayer):
                 A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, positions, slots,
                 starts, ends, pslots_t, init_t, (k_pool, v_pool, ak_pool, av_pool),
                 self.k_norm.norm.weight, self.k_norm.norm.eps, kplane, vplane, H, R, D,
+                max_len=max((qsl[r + 1] - qsl[r] for r in keep), default=0),
             )
+            q_scale = prefill_q_prescale(self.scale, self.softcap)
             q = tpa_prefill_q(
                 q_all, positions, self.q_norm.norm.weight, self.softmax_scaler, self.q_norm.norm.eps,
                 float(getattr(self.config, "sliding_window_size", 0) or 0),
-                self.num_attention_heads_local, D,
+                self.num_attention_heads_local, D, out_scale=q_scale,
             )
         else:
+            q_scale = None
             q = self._factor_prefill_glue_torch(
                 positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, slots,
                 kplane, vplane, starts, ends, pslots_t, init_t,
@@ -682,14 +686,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
         else:
             k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
-        out = flash_attn_varlen_func(
-            q=q, k=k_all, v=v_all,
-            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
-            cu_seqlens_q=cu_q_dev,
-            max_seqlen_k=max(lengths),
-            cu_seqlens_k=cu_k_dev,
-            softmax_scale=self.scale, causal=True, softcap=self.softcap,
-            fa_version=get_flash_attn_version(),
+        out = tpa_varlen_attention(
+            q, k_all, v_all, cu_q_dev, cu_k_dev,
+            max(qsl[r + 1] - qsl[r] for r in range(nreq)), max(lengths),
+            self.scale, self.softcap, prescaled=q_scale is not None,
         )
         return out.reshape(npt, -1)
 
@@ -744,11 +744,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
         v = (1 - a_v) * v
         q = self._q_for_attention(q_all, positions)
         cu = torch.tensor([0, n], dtype=torch.int32, device=q.device)
-        out = flash_attn_varlen_func(
-            q=q, k=k, v=v, max_seqlen_q=n, cu_seqlens_q=cu, max_seqlen_k=n, cu_seqlens_k=cu,
-            softmax_scale=self.scale, causal=True, softcap=self.softcap,
-            fa_version=get_flash_attn_version(),
-        )
+        out = tpa_varlen_attention(q, k, v, cu, cu, n, n, self.scale, self.softcap)
         attn_out.copy_(out.reshape(n, -1))
 
     @property

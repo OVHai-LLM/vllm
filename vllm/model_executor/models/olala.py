@@ -55,6 +55,7 @@ from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     olala_moe_small,
     moe_cat_shared,
 )
+from vllm.model_executor.layers.mamba.olala.latent_moe_fused import olala_moe_fused
 from vllm.model_executor.layers.mamba.olala.latent_moe_updown import (
     UPDOWN_ENABLED,
     olala_moe_updown,
@@ -260,6 +261,8 @@ class OlalaLatentMoE(nn.Module):
             and (quant_config is None or experts_int8)
             and get_tensor_model_parallel_world_size() == 1
             and not parallel_config.enable_eplb
+            # EP dispatch is collective: every rank must take the runner path.
+            and not parallel_config.enable_expert_parallel
         )
         moe_kwargs = dict(
             num_experts=self.num_experts,
@@ -308,6 +311,12 @@ class OlalaLatentMoE(nn.Module):
             and quant_config is None
             and os.environ.get("OLALA_MOE_MEDIUM", "1") != "0"
         )
+        # Opt-in: medium batches through one persistent kernel (routing,
+        # compaction, up, relu^2, down; latent_moe_fused.py).
+        self._fused_moe_path = (
+            self._medium_path and os.environ.get("OLALA_MOE_FUSED", "0") == "1"
+        )
+
         # Decode batches (small / medium paths): the router GEMM is merged
         # into the input GEMM inside the op. Needs the bf16 router weight that
         # GateLinear keeps on Hopper / Blackwell. OLALA_MOE_ENTRY=0 disables.
@@ -419,7 +428,12 @@ class OlalaLatentMoE(nn.Module):
         if self._medium_path and hidden_states.shape[0] <= MEDIUM_BATCH_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
             re = self.experts.routed_experts
-            medium = olala_moe_updown if UPDOWN_ENABLED else olala_moe_medium
+            if UPDOWN_ENABLED:
+                medium = olala_moe_updown
+            elif self._fused_moe_path:
+                medium = olala_moe_fused
+            else:
+                medium = olala_moe_medium
             return medium(
                 hidden_states,
                 router_logits,
@@ -1194,21 +1208,23 @@ class OlalaForCausalLM(
                             f"{target_prefix}.experts."
                             f"{'w13_weight' if is_w1 else 'w2_weight'}"
                         )
+                        # With expert parallelism the loader declines the
+                        # experts of other ranks; at least one must land here.
+                        accepted = 0
                         for expert_id in range(loaded_weight.shape[0]):
-                            success = param.weight_loader(
+                            accepted += bool(param.weight_loader(
                                 param,
                                 loaded_weight[expert_id],
                                 target,
                                 shard_id=shard_id,
                                 expert_id=expert_id,
                                 return_success=True,
+                            ))
+                        if not accepted:
+                            raise RuntimeError(
+                                f"Olala load_weights: no expert of {target} "
+                                f"was accepted by the loader."
                             )
-                            if not success:
-                                raise RuntimeError(
-                                    f"Olala load_weights: expert weight "
-                                    f"{target} (expert {expert_id}) was not "
-                                    f"accepted by the loader."
-                                )
                         loaded.add(target)
                         handled = True
                     elif tail == "expert_bias":

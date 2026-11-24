@@ -613,6 +613,14 @@ def _hopper() -> bool:
     return torch.cuda.get_device_capability()[0] == 9
 
 
+def _blackwell_kernel() -> str | None:
+    """"tc" on sm_100 / sm_103 (tpa_factor_decode_tc.cu: tcgen05 + TMEM, 16-31% faster than the mma.sync kernel
+    on B300), None elsewhere or with OLALA_TPA_DECODE_KERNEL=sm80 (the generic kernel)."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        return None
+    return None if os.environ.get("OLALA_TPA_DECODE_KERNEL", "tc") == "sm80" else "tc"
+
+
 @lru_cache(maxsize=1)
 def _load_kernel():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
@@ -622,6 +630,15 @@ def _load_kernel():
             "olala_tpa_factor_decode",
             "tpa_factor_decode.cu",
             ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+            ["-lcuda"],
+        )
+    elif _blackwell_kernel():
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}{minor}a"   # tcgen05 needs the arch-specific target
+        ext = load_extension(
+            f"olala_tpa_factor_decode_tc_sm{arch}",
+            "tpa_factor_decode_tc.cu",
+            ["-O3", "-std=c++17", "--use_fast_math", f"-gencode=arch=compute_{arch},code=sm_{arch}"],
             ["-lcuda"],
         )
     else:
@@ -648,7 +665,9 @@ def _target_ctas() -> int:
 
 def split_table_path() -> str:
     name = torch.cuda.get_device_name().replace(" ", "_")
-    return os.path.join(SPLIT_TABLE_DIR, f"tpa_factor_splits,device_name={name}.json")
+    kind = _blackwell_kernel()
+    suffix = f",kernel={kind}" if kind else ""
+    return os.path.join(SPLIT_TABLE_DIR, f"tpa_factor_splits,device_name={name}{suffix}.json")
 
 
 @lru_cache(maxsize=1)
